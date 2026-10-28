@@ -1,0 +1,42 @@
+# Blokada katalogów z danymi i wynikami
+data/raw/*
+data/external/*
+data/interim/*
+submissions/*
+
+!data/raw/.gitkeep
+!data/external/.gitkeep
+!data/interim/.gitkeep
+!submissions/.gitkeep
+
+# Blokada plików danych, wideo i modeli po rozszerzeniach
+*.parquet
+*.csv
+*.xml
+*.json
+*.jsonl
+*.h5
+*.pkl
+*.pickle
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.gif
+*.zip
+*.tar
+*.tar.gz
+
+# Blokada notatników Jupyter (chroni przed zapisanymi wykresami z meczów)
+*.ipynb
+.ipynb_checkpoints/
+
+# Środowisko Python i system
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+.DS_Store
