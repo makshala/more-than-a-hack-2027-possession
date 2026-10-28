@@ -1,11 +1,10 @@
 # Blokada katalogów z danymi i wynikami
-data/raw/*
-data/external/*
-data/interim/*
 submissions/*
-
-!data/raw/.gitkeep
-!data/external/.gitkeep
+data/tactical/*
+data/broadcast/*
+!data/tactical/.gitkeep
+!data/broadcast/.gitkeep
+data/interim/*
 !data/interim/.gitkeep
 !submissions/.gitkeep
 
