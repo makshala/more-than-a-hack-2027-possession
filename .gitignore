@@ -25,6 +25,8 @@ data/interim/*
 *.zip
 *.tar
 *.tar.gz
+*.jpg
+*.png
 
 # Blokada notatników Jupyter (chroni przed zapisanymi wykresami z meczów)
 *.ipynb
@@ -39,3 +41,4 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+
