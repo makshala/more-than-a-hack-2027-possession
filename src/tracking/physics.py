@@ -155,7 +155,7 @@ def compute_player_velocities_savgol(px, py, ps):
     return px_smooth, py_smooth, ps_smooth, vx, vy
 
 
-def compute_focal_attention_centroid(px, py, ps, pvx, pvy):
+def compute_focal_attention_centroid(px, py, ps, pvx, pvy, lookat_x=None, lookat_y=None):
     valid = ~np.isnan(px)
     n_visible = valid.sum(axis=1)
     px_z, py_z = np.where(valid, px, 0.0), np.where(valid, py, 0.0)
@@ -165,6 +165,11 @@ def compute_focal_attention_centroid(px, py, ps, pvx, pvy):
     w_sum1 = np.maximum(1e-5, w_coarse.sum(axis=1))
     cx1 = np.where(n_visible > 0, (px_z * w_coarse).sum(axis=1) / w_sum1, PITCH_LENGTH / 2.0)
     cy1 = np.where(n_visible > 0, (py_z * w_coarse).sum(axis=1) / w_sum1, PITCH_WIDTH / 2.0)
+
+    if lookat_x is not None and lookat_y is not None:
+        has_lk = (~np.isnan(lookat_x)) & (~np.isnan(lookat_y))
+        cx1 = np.where(has_lk, 0.65 * cx1 + 0.35 * lookat_x, cx1)
+        cy1 = np.where(has_lk, 0.65 * cy1 + 0.35 * lookat_y, cy1)
 
     dx1, dy1 = np.where(valid, cx1[:, None] - px_z, 0.0), np.where(valid, cy1[:, None] - py_z, 0.0)
     dist1 = np.hypot(dx1, dy1)
@@ -176,6 +181,12 @@ def compute_focal_attention_centroid(px, py, ps, pvx, pvy):
     w_sum2 = np.maximum(1e-5, w_focal.sum(axis=1))
     att_x = np.where(n_visible > 0, (px_z * w_focal).sum(axis=1) / w_sum2, PITCH_LENGTH / 2.0).astype(np.float32)
     att_y = np.where(n_visible > 0, (py_z * w_focal).sum(axis=1) / w_sum2, PITCH_WIDTH / 2.0).astype(np.float32)
+
+    if lookat_x is not None and lookat_y is not None:
+        has_lk = (~np.isnan(lookat_x)) & (~np.isnan(lookat_y))
+        att_x = np.where(has_lk, 0.70 * att_x + 0.30 * lookat_x, att_x).astype(np.float32)
+        att_y = np.where(has_lk, 0.70 * att_y + 0.30 * lookat_y, att_y).astype(np.float32)
+
     spread_m = np.sqrt(np.where(n_visible > 0, (((px_z - att_x[:, None]) ** 2 + (py_z - att_y[:, None]) ** 2) * w_focal).sum(axis=1) / w_sum2, 100.0)).astype(np.float32)
     
     return att_x, att_y, spread_m
@@ -204,14 +215,26 @@ def compute_gap_boundary_timers(status_code):
     return frames_since, frames_to
 
 
-def impute_ball_and_uncertainty(bx, by, att_x, att_y, att_spread):
+def impute_ball_and_uncertainty(bx, by, att_x, att_y, att_spread, brd_bx=None, brd_by=None):
     n_frames = len(bx)
-    observed = ~np.isnan(bx)
-    ball_x, ball_y = bx.copy(), by.copy()
+    bx_work, by_work = bx.copy(), by.copy()
+    patched_by_brd = np.zeros(n_frames, dtype=bool)
+
+    if brd_bx is not None and brd_by is not None:
+        tac_missing = np.isnan(bx_work)
+        brd_valid_obs = (~np.isnan(brd_bx)) & (~np.isnan(brd_by))
+        patched_by_brd = tac_missing & brd_valid_obs
+        if patched_by_brd.any():
+            bx_work[patched_by_brd] = brd_bx[patched_by_brd]
+            by_work[patched_by_brd] = brd_by[patched_by_brd]
+            print(f"[BROADCAST FUSION] Patched {int(patched_by_brd.sum())} tactical ball gaps using Broadcast ATD observations.")
+
+    observed = ~np.isnan(bx_work)
+    ball_x, ball_y = bx_work.copy(), by_work.copy()
     status_code = np.full(n_frames, 2, dtype=np.int8)
     status_code[observed] = 0
     sigma_m = np.full(n_frames, 8.0, dtype=np.float32)
-    sigma_m[observed] = 0.5
+    sigma_m[observed] = np.where(patched_by_brd[observed], 1.1, 0.5)
     gap_length_arr = np.zeros(n_frames, dtype=np.int32)
 
     padded = np.concatenate(([True], observed, [True]))
@@ -225,8 +248,8 @@ def impute_ball_and_uncertainty(bx, by, att_x, att_y, att_spread):
         if gap_len <= SHORT_GAP_MAX_FRAMES and has_left and has_right:
             status_code[start:end] = 1
             alpha = np.linspace(0.0, 1.0, gap_len + 2, dtype=np.float32)[1:-1]
-            ball_x[start:end] = (1.0 - alpha) * bx[start - 1] + alpha * bx[end]
-            ball_y[start:end] = (1.0 - alpha) * by[start - 1] + alpha * by[end]
+            ball_x[start:end] = (1.0 - alpha) * bx_work[start - 1] + alpha * bx_work[end]
+            ball_y[start:end] = (1.0 - alpha) * by_work[start - 1] + alpha * by_work[end]
             sigma_m[start:end] = 0.5 + 0.16 * np.minimum(np.arange(1, gap_len + 1), np.arange(gap_len, 0, -1))
         else:
             status_code[start:end] = 2
@@ -236,18 +259,18 @@ def impute_ball_and_uncertainty(bx, by, att_x, att_y, att_spread):
             if has_left and has_right:
                 alpha = np.linspace(0.0, 1.0, gap_len + 2, dtype=np.float32)[1:-1]
                 w_bridge = np.exp(-dist_to_edge / 40.0).astype(np.float32)
-                est_x = w_bridge * ((1.0 - alpha) * bx[start - 1] + alpha * bx[end]) + (1.0 - w_bridge) * est_x
-                est_y = w_bridge * ((1.0 - alpha) * by[start - 1] + alpha * by[end]) + (1.0 - w_bridge) * est_y
+                est_x = w_bridge * ((1.0 - alpha) * bx_work[start - 1] + alpha * bx_work[end]) + (1.0 - w_bridge) * est_x
+                est_y = w_bridge * ((1.0 - alpha) * by_work[start - 1] + alpha * by_work[end]) + (1.0 - w_bridge) * est_y
             else:
                 blend_len = min(25, gap_len)
                 if has_left:
                     w = np.linspace(0.85, 0.0, blend_len, dtype=np.float32)
-                    est_x[:blend_len] = w * bx[start - 1] + (1.0 - w) * est_x[:blend_len]
-                    est_y[:blend_len] = w * by[start - 1] + (1.0 - w) * est_y[:blend_len]
+                    est_x[:blend_len] = w * bx_work[start - 1] + (1.0 - w) * est_x[:blend_len]
+                    est_y[:blend_len] = w * by_work[start - 1] + (1.0 - w) * est_y[:blend_len]
                 if has_right:
                     w = np.linspace(0.0, 0.85, blend_len, dtype=np.float32)
-                    est_x[-blend_len:] = w * bx[end] + (1.0 - w) * est_x[-blend_len:]
-                    est_y[-blend_len:] = w * by[end] + (1.0 - w) * est_y[-blend_len:]
+                    est_x[-blend_len:] = w * bx_work[end] + (1.0 - w) * est_x[-blend_len:]
+                    est_y[-blend_len:] = w * by_work[end] + (1.0 - w) * est_y[-blend_len:]
 
             ball_x[start:end], ball_y[start:end] = est_x, est_y
             sigma_m[start:end] = np.clip(0.32 * att_spread[start:end] * (1.0 - 0.5 * np.exp(-dist_to_edge / 35.0)), 2.5, 25.0)
@@ -257,7 +280,6 @@ def impute_ball_and_uncertainty(bx, by, att_x, att_y, att_spread):
     out_of_bounds = ((ball_x < 0.5) | (ball_x > PITCH_LENGTH - 0.5) | (ball_y < 0.5) | (ball_y > PITCH_WIDTH - 0.5)).astype(np.int8)
 
     return ball_x, ball_y, status_code, status_label, sigma_m, gap_length_arr, frames_since_gap, frames_to_gap, out_of_bounds
-
 
 def compute_clean_ball_kinematics(ball_x, ball_y, status_code):
     is_obs = (status_code <= 1).astype(np.float32)
