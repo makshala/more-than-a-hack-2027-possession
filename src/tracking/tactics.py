@@ -351,6 +351,17 @@ def extract_canonical_team_features(px, py, ps, pvx, pvy, slot_teams, ball_x, ba
         causal100[p_idx] = lfilter(w100, 1.0, s_half)
 
     feats.update({"control_diff_roll50": roll50, "control_diff_roll100": roll100, "control_diff_causal50": causal50, "control_diff_causal100": causal100})
+    # Edge-transition Lead/Lag deltas (0.4s = 10 frames, 1.0s = 25 frames) for sharp spell boundaries
+    for shift_f, suffix in ((10, "10f"), (25, "25f")):
+        fwd_diff = np.roll(diff_m, -shift_f)
+        bwd_diff = np.roll(diff_m, shift_f)
+        fwd_diff[-shift_f:], bwd_diff[:shift_f] = diff_m[-shift_f:], diff_m[:shift_f]
+        feats[f"near1_diff_leadlag_{suffix}"] = (fwd_diff - bwd_diff).astype(np.float32)
+
+        fwd_pc = np.roll(feats["home_pitch_control"], -shift_f)
+        bwd_pc = np.roll(feats["home_pitch_control"], shift_f)
+        fwd_pc[-shift_f:], bwd_pc[:shift_f] = feats["home_pitch_control"][-shift_f:], feats["home_pitch_control"][:shift_f]
+        feats[f"pitch_ctrl_leadlag_{suffix}"] = (fwd_pc - bwd_pc).astype(np.float32)
     return feats
 
 

@@ -85,7 +85,29 @@ def compute_broadcast_lookat(df_brd: pd.DataFrame, frame_w: int = 1920, frame_h:
 
     return lookat_x, lookat_y
 
-
+#for tracking: including ball coordinates from broadcast 
+def load_atd_ball_coordinates(atd_path: Path, n_frames: int):
+    bx = np.full(n_frames, np.nan, dtype=np.float64)
+    by = np.full(n_frames, np.nan, dtype=np.float64)
+    if not atd_path.exists():
+        return bx, by
+    with open(atd_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            parts = line.split(":")
+            if len(parts) != 3:
+                continue
+            idx = int(parts[0]) - 1
+            if not (0 <= idx < n_frames):
+                continue
+            b_str = parts[2].strip()
+            if b_str and not b_str.startswith("N"):
+                vals = b_str.split(",")
+                try:
+                    bx[idx] = float(vals[0])
+                    by[idx] = float(vals[1])
+                except (ValueError, IndexError):
+                    pass
+    return bx, by
 # ===========================================================================
 # MODULE 3: TIMELINE ALIGNMENT AND PARQUET EXPORT
 # ===========================================================================
@@ -103,13 +125,13 @@ def build_stage0_video():
     if not brd_hom_path.exists():
         brd_hom_path = list((MAIN_DIR / "data" / "broadcast").glob("*.csv"))[0]
 
+    brd_atd_path = MAIN_DIR / "data" / "broadcast" / (SOURCES["broadcast"]["stem"] + SUFFIXES["atd_raw"])
+
     n_tac = SOURCES["tactical"]["n_video_frames"]    # 199,319
     n_brd = SOURCES["broadcast"]["n_video_frames"]   # 164,488
 
-    print(f"[1/3] Wczytywanie homografii Broadcast: {brd_hom_path.name} ({n_brd} wierszy)...")
+    print(f"[1/3] Wczytywanie homografii i ATD Broadcast: {brd_hom_path.name} ({n_brd} wierszy)...")
     df_brd = pd.read_csv(brd_hom_path)
-
-    # Upewniamy się, że wiersze są posortowane po kolumnie frame (0 .. n_brd-1)
     col_f = "frame" if "frame" in df_brd.columns else df_brd.columns[0]
     df_brd = df_brd.sort_values(col_f).reset_index(drop=True)
 
@@ -120,28 +142,34 @@ def build_stage0_video():
         else np.full(n_brd, np.nan)
     )
 
+    # Wczytanie pozycji piłki z kamery broadcast
+    brd_bx, brd_by = load_atd_ball_coordinates(brd_atd_path, n_brd)
+
     print("[2/3] Wyliczanie punktu patrzenia kamery (cam_lookat_x, cam_lookat_y)...")
     brd_lookat_x, brd_lookat_y = compute_broadcast_lookat(df_brd)
 
     # Inicjalizacja docelowych kolumn na osi czasu Tactical (0 .. 199,318)
     tac_frames = np.arange(n_tac, dtype=np.int32)
     aligned_brd_frame = np.full(n_tac, -1, dtype=np.int32)
-    aligned_valid = np.zeros(n_tac, dtype=np.int8)  # Domyślnie 0 (przerwa / poza meczem / powtórka)
+    aligned_valid = np.zeros(n_tac, dtype=np.int8)
     aligned_lookat_x = np.full(n_tac, np.nan, dtype=np.float64)
     aligned_lookat_y = np.full(n_tac, np.nan, dtype=np.float64)
     aligned_reproj = np.full(n_tac, np.nan, dtype=np.float64)
+    aligned_ball_x = np.full(n_tac, np.nan, dtype=np.float64)
+    aligned_ball_y = np.full(n_tac, np.nan, dtype=np.float64)
 
-    print("[3/3] Przesuwanie osi czasu Broadcast na oś Tactical wg sync_offset.json...")
+    print("[3/3] Przesuwanie osi czasu Broadcast na oś Tactical wg sync_offset.json (z uwzględnieniem dryfu)...")
     for half_key, info in sync_data.items():
         tac_start = int(info["start_frame"])
         tac_end = int(info["end_frame"])
-        offset = int(info["offset_frames"])  # tac_frame = brd_frame + offset
+        
+        # Użycie dynamicznego dryfu wyliczonego przez sync_cameras.py
+        slope = float(info.get("drift_slope", 0.0))
+        intercept = float(info.get("drift_intercept", info["offset_frames"]))
 
-        # Wycinek klatek dla danej połowy na osi Tactical
         t_idx = np.arange(tac_start, tac_end + 1, dtype=np.int32)
-        b_idx = t_idx - offset
+        b_idx = np.round((t_idx - intercept) / (1.0 + slope)).astype(np.int32)
 
-        # Zabezpieczenie przed wyjściem poza zakres klatek wideo
         in_bounds = (t_idx >= 0) & (t_idx < n_tac) & (b_idx >= 0) & (b_idx < n_brd)
         t_sub = t_idx[in_bounds]
         b_sub = b_idx[in_bounds]
@@ -151,22 +179,26 @@ def build_stage0_video():
         aligned_lookat_x[t_sub] = brd_lookat_x[b_sub]
         aligned_lookat_y[t_sub] = brd_lookat_y[b_sub]
         aligned_reproj[t_sub] = brd_reproj[b_sub]
+        aligned_ball_x[t_sub] = brd_bx[b_sub]
+        aligned_ball_y[t_sub] = brd_by[b_sub]
 
         valid_in_half = int(np.sum(aligned_valid[t_sub] == 1))
         print(
-            f"   -> {half_key.upper()}: przesunięto o {offset:+d} kl. "
-            f"(Tactical {tac_start}..{tac_end} <-> Broadcast {b_sub[0]}..{b_sub[-1]}) | "
+            f"   -> {half_key.upper()}: zsynchronizowano z dryfem "
+            f"(Tactical {tac_start}..{tac_end}) | "
             f"valid==1: {valid_in_half}/{len(t_sub)} kl."
         )
 
-    # Budowa finalnej tabeli
+    # Budowa finalnej tabeli z nowymi kolumnami brd_ball_x i brd_ball_y
     df_stage0 = pd.DataFrame({
-        "frame": tac_frames,                  # Oś główna Tactical: 0 .. 199318
-        "broadcast_frame": aligned_brd_frame, # Odpowiadająca klatka Broadcast (-1 poza połowami)
-        "valid": aligned_valid,               # Dla Deadballa: 1 = kamera TV na boisku, 0 = powtórka/przerwa
-        "cam_lookat_x": aligned_lookat_x,     # Dla Trackingu: współrzędna X środka kamery TV [0..1]
-        "cam_lookat_y": aligned_lookat_y,     # Dla Trackingu: współrzędna Y środka kamery TV [0..1]
-        "reprojection_error": aligned_reproj  # Błąd kalibracji homografii (im niższy, tym pewniejszy lookat)
+        "frame": tac_frames,
+        "broadcast_frame": aligned_brd_frame,
+        "valid": aligned_valid,
+        "cam_lookat_x": aligned_lookat_x,
+        "cam_lookat_y": aligned_lookat_y,
+        "reprojection_error": aligned_reproj,
+        "brd_ball_x": aligned_ball_x,  # <-- Kopalnia złota dla trackingu
+        "brd_ball_y": aligned_ball_y   # <-- Kopalnia złota dla trackingu
     })
 
     out_dir = MAIN_DIR / "data" / "interim"
@@ -176,13 +208,12 @@ def build_stage0_video():
     df_stage0.to_parquet(parquet_path, index=False)
 
     total_valid = int(np.sum(aligned_valid == 1))
-    total_lookat = int(np.sum(~np.isnan(aligned_lookat_x)))
+    total_brd_balls = int(np.sum(~np.isnan(aligned_ball_x)))
     print("\n" + "=" * 72)
     print(f"[SUKCES] Zapisano plik: {parquet_path}")
-    print(f"         Wiersze ogółem (oś Tactical): {len(df_stage0)}")
+    print(f"         Wiersze ogółem: {len(df_stage0)}")
     print(f"         Klatki valid == 1 (gra live): {total_valid} ({100*total_valid/n_tac:.1f}%)")
-    print(f"         Klatki valid == 0 (przerwy):  {n_tac - total_valid} ({100*(n_tac - total_valid)/n_tac:.1f}%)")
-    print(f"         Wyliczone punkty cam_lookat:  {total_lookat}")
+    print(f"         Zsynchronizowane pozycje piłki Broadcast: {total_brd_balls}")
     print("=" * 72)
 
     return df_stage0
