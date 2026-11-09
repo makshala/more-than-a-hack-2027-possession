@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import Dict, Optional, Union
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import pandas as pd
@@ -20,7 +25,7 @@ def _compute_restart_impulse_signal(
     live_tag_onset_signal: np.ndarray,
 ) -> np.ndarray:
     """
-    Oblicza dla każdej klatki siłę impulsu wznowienia gry (\Phi_{D -> L}, "klatka 0").
+    Oblicza dla każdej klatki siłę impulsu wznowienia gry (phi_{D -> L}, "klatka 0").
     Integruje 6 sygnałów fizycznych i taktycznych:
     1. Skok przyspieszenia i prędkości piłki (taktycznej lub Broadcast) po fazie spoczynku.
     2. Zryw prędkości zawodnika wykonującego stały fragment gry (taker burst).
@@ -454,16 +459,11 @@ def run_deadball_pipeline(
     smart_tags_xml_path: Optional[Union[str, Path]] = None,
     raw_atd_df: Optional[pd.DataFrame] = None,
     output_parquet_path: Union[str, Path] = "data/interim/stage2_deadball.parquet",
-    public_gt_path: Union[str, Path] = "evaluation/gt/BAR-ATH_possession_gt_public.csv",
+    public_gt_path: Optional[Union[str, Path]] = None,
 ) -> pd.DataFrame:
     """
     Główny potok modelu stanu D (Top 1%):
-    1. Wczytuje stage1_tracking.parquet oraz priorytety Smart Tagging (wszystkie 638 tagów XML).
-    2. Oblicza wskaźniki kinematyczne braku gry z kinematic_d.py (w tym regułę wykluczenia FIFA,
-       control_void_score oraz impulsy wyjścia piłki ball_death_flux).
-    3. Przyciąga obie krawędzie każdego okna D (d_start oraz "klatkę 0" wznowienia) z walidacją sp_type.
-    4. Dekoduje globalnie optymalną trajektorię stanu D za pomocą algorytmu Viterbiego w przestrzeni Log-Odds.
-    5. Zapisuje w pełni zwalidowany plik stage2_deadball.parquet.
+    Domyślnie public_gt_path=None gwarantuje 100% separacji od pliku Ground Truth w przebiegu produkcyjnym.
     """
     stage1_path = Path(stage1_parquet_path)
     if not stage1_path.exists():
@@ -509,7 +509,6 @@ def run_deadball_pipeline(
             & (~stage1_df["brd_ball_x"].isna().to_numpy())
         )
 
-    # Fuzja probabilistyczna kotwicy XML i kinematyki graczy
     p_in_window = 0.44 * sp_prior_prob + 0.56 * kin_score
     oob_confident = ball_oob & (ball_visible | (kin_score > 0.56))
     p_out_window = np.where(
@@ -520,7 +519,6 @@ def run_deadball_pipeline(
 
     p_dead_raw = np.where(is_sp_window, p_in_window, p_out_window).astype(np.float32)
 
-    # Korekta po zakończeniu powtórki TV (frames_since_brd_replay)
     if "frames_since_brd_replay" in stage1_df.columns:
         fs_rep = stage1_df["frames_since_brd_replay"].to_numpy(dtype=np.int32)
         just_after_replay = (fs_rep > 0) & (fs_rep <= 60)
@@ -530,12 +528,10 @@ def run_deadball_pipeline(
         )
         p_dead_raw = np.where(just_after_replay & live_dynamics, p_dead_raw * 0.18, p_dead_raw)
 
-    # Bramkarz trzymający piłkę w żywej grze
     if "gk_holding_ball_proxy" in stage1_df.columns:
         gk_hold = stage1_df["gk_holding_ball_proxy"].to_numpy(dtype=np.int8) != 0
         p_dead_raw = np.where(gk_hold & ~is_sp_window, p_dead_raw * 0.22, p_dead_raw)
 
-    # Obliczenie impulsu wznowienia ("klatki 0") i przyciągnięcie obu krawędzi (d_start i frame_zero)
     restart_flux = _compute_restart_impulse_signal(stage1_df, restart_hint, live_onset_sig)
     p_dead_snapped = _snap_both_deadball_edges(
         p_dead_raw=p_dead_raw,
@@ -548,7 +544,6 @@ def run_deadball_pipeline(
         ball_y_centered=by_centered,
     )
 
-    # Globalne dekodowanie Viterbiego w przestrzeni Log-Odds
     period_arr = (
         stage1_df["period"].to_numpy(dtype=np.int8)
         if "period" in stage1_df.columns
@@ -564,7 +559,6 @@ def run_deadball_pipeline(
         min_dead_duration_frames=65,
     )
 
-    # Twarde reguły domenowe dla klatek poza czasem gry (period == 0, is_pre_kickoff_d, st_post_goal_dead)
     if "period" in stage1_df.columns:
         non_play_period = period_arr == 0
         p_dead = np.where(non_play_period, 1.0, p_dead)
@@ -580,7 +574,6 @@ def run_deadball_pipeline(
     p_dead = np.nan_to_num(p_dead, nan=0.0, posinf=1.0, neginf=0.0)
     p_dead = np.clip(p_dead, 0.0, 1.0).astype(np.float32)
 
-    # Uzupełnienie restart_team_hint dla wykrytych przerw spoza XML
     missing_hint_mask = pd.isna(restart_hint) & (p_dead >= 0.50)
     if np.any(missing_hint_mask) and "near1_dist_diff_m" in stage1_df.columns:
         team_signal = stage1_df["near1_dist_diff_m"].to_numpy(dtype=np.float32).copy()
@@ -600,7 +593,6 @@ def run_deadball_pipeline(
         "restart_team_hint": pd.Categorical(restart_hint, categories=["H", "A"]),
     })
 
-    # Rygorystyczne asercje kontraktu wyjściowego (SUBMISSION.md / DATA.md)
     assert len(result_df) == N_FRAMES, f"Błędna liczba wierszy: {len(result_df)} != {N_FRAMES}"
     assert not result_df["frame"].isna().any(), "Kolumna 'frame' zawiera wartości NaN!"
     assert not result_df["p_dead"].isna().any(), "Kolumna 'p_dead' zawiera wartości NaN!"
@@ -611,15 +603,16 @@ def run_deadball_pipeline(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result_df.to_parquet(output_path, index=False)
 
-    # Automatyczna diagnostyka na 5-minutowym publicznym Ground Truth (jeśli plik jest dostępny)
-    diag = evaluate_deadball_on_public_gt(result_df, public_gt_path=public_gt_path)
-    if diag is not None:
-        print(
-            f"[Diagnostyka Public 5-min GT] D_F1={diag['d_f1']:.4f} "
-            f"(Prec={diag['d_precision']:.4f}, Rec={diag['d_recall']:.4f}) | "
-            f"Klatki D: pred={diag['pred_d_frames']} vs gt={diag['true_d_frames']} | "
-            f"Segmenty D: pred={diag['pred_d_segments']} vs gt={diag['true_d_segments']}"
-        )
+    # Sanity-check uruchamiany wyłącznie na jawne żądanie użytkownika
+    if public_gt_path is not None:
+        diag = evaluate_deadball_on_public_gt(result_df, public_gt_path=public_gt_path)
+        if diag is not None:
+            print(
+                f"[Sanity-Check 5-min Public GT] D_F1={diag['d_f1']:.4f} "
+                f"(Prec={diag['d_precision']:.4f}, Rec={diag['d_recall']:.4f}) | "
+                f"Klatki D: pred={diag['pred_d_frames']} vs gt={diag['true_d_frames']} | "
+                f"Segmenty D: pred={diag['pred_d_segments']} vs gt={diag['true_d_segments']}"
+            )
 
     return result_df
 
@@ -647,18 +640,25 @@ if __name__ == "__main__":
         help="Ścieżka wyjściowa dla pliku stage2_deadball.parquet",
     )
     parser.add_argument(
+        "--check-public-gt",
+        action="store_true",
+        help="Uruchamia wyłącznie odczytowy sanity-check potoku na 5-minutowym publicznym GT",
+    )
+    parser.add_argument(
         "--public-gt",
         type=str,
         default="evaluation/gt/BAR-ATH_possession_gt_public.csv",
-        help="Ścieżka do publicznego 5-minutowego GT do weryfikacji potoku",
+        help="Ścieżka do publicznego 5-minutowego GT (używana tylko gdy podano --check-public-gt)",
     )
     args = parser.parse_args()
 
     xml_file = args.xml if Path(args.xml).exists() else None
+    gt_file = args.public_gt if args.check_public_gt else None
+
     df_out = run_deadball_pipeline(
         stage1_parquet_path=args.stage1,
         smart_tags_xml_path=xml_file,
         output_parquet_path=args.output,
-        public_gt_path=args.public_gt,
+        public_gt_path=gt_file,
     )
     print(f"Zapisano pomyślnie {len(df_out)} klatek do {args.output}.")
