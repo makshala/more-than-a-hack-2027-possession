@@ -175,3 +175,88 @@ def audit_and_patch_nans(df, max_nan_ratio=0.05):
 
     df[nan_cols] = df[nan_cols].ffill().bfill().fillna(0.0)
     assert not df.columns[df.isna().any()].tolist(), "NaN values still present after patching!"
+
+def load_stage0_broadcast_features(n_frames, period):
+    """
+    Loads synchronized Broadcast camera features and ball coordinates from data/interim/stage0_video.parquet.
+    Falls back gracefully if stage0_video.parquet does not exist yet.
+    """
+    stage0_path = os.path.join(ROOT, "data", "interim", "stage0_video.parquet")
+
+    brd_valid = np.zeros(n_frames, dtype=np.int8)
+    brd_is_replay = np.zeros(n_frames, dtype=np.int8)
+    frames_since_replay = np.full(n_frames, 10000, dtype=np.int32)
+    lookat_x = np.full(n_frames, np.nan, dtype=np.float32)
+    lookat_y = np.full(n_frames, np.nan, dtype=np.float32)
+    brd_ball_x = np.full(n_frames, np.nan, dtype=np.float32)
+    brd_ball_y = np.full(n_frames, np.nan, dtype=np.float32)
+    lookat_speed = np.zeros(n_frames, dtype=np.float32)
+    brd_reproj = np.full(n_frames, 2.0, dtype=np.float32)
+
+    if not os.path.exists(stage0_path):
+        print("[BROADCAST FUSION] stage0_video.parquet not found — running in pure tactical mode.")
+        return lookat_x, lookat_y, brd_ball_x, brd_ball_y, {
+            "brd_valid": brd_valid,
+            "brd_is_replay": brd_is_replay,
+            "frames_since_brd_replay": frames_since_replay,
+            "brd_lookat_x": np.full(n_frames, PITCH_LENGTH / 2.0, dtype=np.float32),
+            "brd_lookat_y": np.full(n_frames, PITCH_WIDTH / 2.0, dtype=np.float32),
+            "brd_lookat_speed_ms": lookat_speed,
+            "brd_ball_x": brd_ball_x,
+            "brd_ball_y": brd_ball_y,
+        }
+
+    df_s0 = pd.read_parquet(stage0_path)
+    m = min(n_frames, len(df_s0))
+
+    brd_valid[:m] = df_s0["valid"].fillna(0).to_numpy(dtype=np.int8)[:m]
+    if "reprojection_error" in df_s0.columns:
+        brd_reproj[:m] = np.nan_to_num(df_s0["reprojection_error"].to_numpy(dtype=np.float32)[:m], nan=2.0)
+
+    raw_lx = df_s0["cam_lookat_x"].to_numpy(dtype=np.float32)[:m] * PITCH_LENGTH
+    raw_ly = df_s0["cam_lookat_y"].to_numpy(dtype=np.float32)[:m] * PITCH_WIDTH
+
+    good_cam = (brd_valid[:m] == 1) & (~np.isnan(raw_lx)) & (~np.isnan(raw_ly)) & (brd_reproj[:m] < 1.5)
+    lookat_x[:m] = np.where(good_cam, np.clip(raw_lx, 0.0, PITCH_LENGTH), np.nan)
+    lookat_y[:m] = np.where(good_cam, np.clip(raw_ly, 0.0, PITCH_WIDTH), np.nan)
+
+    if "brd_ball_x" in df_s0.columns and "brd_ball_y" in df_s0.columns:
+        raw_bx = df_s0["brd_ball_x"].to_numpy(dtype=np.float32)[:m] * PITCH_LENGTH
+        raw_by = df_s0["brd_ball_y"].to_numpy(dtype=np.float32)[:m] * PITCH_WIDTH
+        good_ball = (brd_valid[:m] == 1) & (~np.isnan(raw_bx)) & (~np.isnan(raw_by))
+        brd_ball_x[:m] = np.where(good_ball, np.clip(raw_bx, 0.0, PITCH_LENGTH), np.nan)
+        brd_ball_y[:m] = np.where(good_ball, np.clip(raw_by, 0.0, PITCH_WIDTH), np.nan)
+
+    brd_is_replay = ((period > 0) & (brd_valid == 0)).astype(np.int8)
+
+    replay_idx = np.flatnonzero(brd_is_replay == 1)
+    if len(replay_idx) > 0:
+        idx_arr = np.arange(n_frames)
+        left_idx = np.searchsorted(replay_idx, idx_arr, side="right") - 1
+        valid_l = left_idx >= 0
+        frames_since_replay[valid_l] = np.minimum(10000, idx_arr[valid_l] - replay_idx[left_idx[valid_l]])
+        frames_since_replay[brd_is_replay == 1] = 0
+
+    lx_cont = pd.Series(lookat_x).ffill().bfill().fillna(PITCH_LENGTH / 2.0).to_numpy(dtype=np.float32)
+    ly_cont = pd.Series(lookat_y).ffill().bfill().fillna(PITCH_WIDTH / 2.0).to_numpy(dtype=np.float32)
+    bx_cont = pd.Series(brd_ball_x).ffill().bfill().fillna(PITCH_LENGTH / 2.0).to_numpy(dtype=np.float32)
+    by_cont = pd.Series(brd_ball_y).ffill().bfill().fillna(PITCH_WIDTH / 2.0).to_numpy(dtype=np.float32)
+
+    same_cam = (brd_valid[:-1] == 1) & (brd_valid[1:] == 1) & (~np.isnan(lookat_x[:-1])) & (~np.isnan(lookat_x[1:]))
+    has_step = np.concatenate(([False], same_cam))
+    dlx = np.diff(lx_cont, prepend=lx_cont[0])
+    dly = np.diff(ly_cont, prepend=ly_cont[0])
+    lookat_speed = np.where(has_step, np.minimum(np.hypot(dlx, dly) / DT, 45.0), 0.0).astype(np.float32)
+
+    n_brd_balls = int(np.sum(~np.isnan(brd_ball_x)))
+    print(f"[BROADCAST FUSION] Integrated stage0: {int(good_cam.sum())} LookAt frames, {n_brd_balls} Broadcast ball observations.")
+    return lookat_x, lookat_y, brd_ball_x, brd_ball_y, {
+        "brd_valid": brd_valid,
+        "brd_is_replay": brd_is_replay,
+        "frames_since_brd_replay": frames_since_replay,
+        "brd_lookat_x": lx_cont,
+        "brd_lookat_y": ly_cont,
+        "brd_lookat_speed_ms": lookat_speed,
+        "brd_ball_x": bx_cont,
+        "brd_ball_y": by_cont,
+    }
