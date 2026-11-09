@@ -1,4 +1,3 @@
-# src/deadball/kinematic_d.py
 from __future__ import annotations
 
 import re
@@ -10,8 +9,27 @@ import pandas as pd
 N_FRAMES: int = 199_319
 PITCH_LENGTH: float = 105.0
 PITCH_WIDTH: float = 68.0
+STAGE1_PITCH_LENGTH: float = 105.3  # Zgodnie z DATA.md oraz specyfikacją stage1_tracking.parquet
 HALF_LENGTH: float = PITCH_LENGTH / 2.0  # 52.5 m
 HALF_WIDTH: float = PITCH_WIDTH / 2.0    # 34.0 m
+
+
+def _align_raw_atd_to_video_frames(atd_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Zgodnie z DATA.md w surowym pliku ATD kolumna frame_id jest indeksowana 1..199319
+    (video_frame = frame_id - 1). Funkcja gwarantuje wyrównanie do 0..199318.
+    """
+    df = atd_df.copy()
+    if "frame_id" in df.columns:
+        min_fid = int(df["frame_id"].min())
+        if min_fid == 1:
+            df["video_frame"] = df["frame_id"].astype(np.int32) - 1
+        else:
+            df["video_frame"] = df["frame_id"].astype(np.int32)
+        df = df.sort_values("video_frame").drop_duplicates("video_frame")
+        full_index = pd.DataFrame({"video_frame": np.arange(N_FRAMES, dtype=np.int32)})
+        df = full_index.merge(df, on="video_frame", how="left")
+    return df.reset_index(drop=True)
 
 
 def _extract_slot_arrays_from_raw_atd(
@@ -20,12 +38,11 @@ def _extract_slot_arrays_from_raw_atd(
     away_slots: Optional[List[int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Wyodrębnia macierze (N, n_slots) dla pozycji X, Y (przeskalowanych do [-52.5, 52.5] x [-34, 34])
-    oraz prędkości S (m/s) z 46-slotowego DataFrame'u ATD (np. z kloppy.metrica).
+    Wyodrębnia macierze (N, n_slots) dla pozycji X, Y przeskalowanych do [-52.5, 52.5] x [-34, 34]
+    oraz prędkości S (m/s) z 46-slotowego DataFrame'u ATD.
     """
-    cols = atd_df.columns
-
-    # Identyfikacja kolumn slotów (konwencja kloppy: '1_x', '1_y', '1_s' lub 'home_1_x' itp.)
+    df = _align_raw_atd_to_video_frames(atd_df)
+    cols = df.columns
     slot_x_cols, slot_y_cols, slot_s_cols = [], [], []
     h_indices, a_indices = [], []
 
@@ -37,7 +54,11 @@ def _extract_slot_arrays_from_raw_atd(
             prefix, slot_num = m.group(1), int(m.group(2))
             base = f"{prefix}_{slot_num}" if prefix else f"{slot_num}"
             y_col = f"{base}_y"
-            s_col = f"{base}_s" if f"{base}_s" in cols else (f"{base}_speed" if f"{base}_speed" in cols else None)
+            s_col = (
+                f"{base}_s"
+                if f"{base}_s" in cols
+                else (f"{base}_speed" if f"{base}_speed" in cols else None)
+            )
             if y_col in cols:
                 matched_slots.append((slot_num, prefix, c, y_col, s_col))
 
@@ -56,42 +77,36 @@ def _extract_slot_arrays_from_raw_atd(
         elif away_slots is not None and slot_num in away_slots:
             a_indices.append(idx)
         else:
-            # W standardowym 46-slotowym ATD pierwsza połowa slotów należy do Home, druga do Away
             if slot_num <= 23:
                 h_indices.append(idx)
             else:
                 a_indices.append(idx)
 
-    x_norm = atd_df[slot_x_cols].to_numpy(dtype=np.float32)
-    y_norm = atd_df[slot_y_cols].to_numpy(dtype=np.float32)
+    x_norm = df[slot_x_cols].to_numpy(dtype=np.float32)
+    y_norm = df[slot_y_cols].to_numpy(dtype=np.float32)
 
-    # Sprawdzenie czy współrzędne są w [0, 1] czy już w metrach
-    max_x = np.nanmax(x_norm) if x_norm.size > 0 else 1.0
+    max_x = float(np.nanmax(x_norm)) if x_norm.size > 0 else 1.0
     if max_x <= 1.5:
         x_m = (x_norm - 0.5) * PITCH_LENGTH
         y_m = (y_norm - 0.5) * PITCH_WIDTH
     else:
-        x_m = x_norm - (PITCH_LENGTH / 2.0)
-        y_m = y_norm - (PITCH_WIDTH / 2.0)
+        x_m = x_norm * (PITCH_LENGTH / STAGE1_PITCH_LENGTH) - HALF_LENGTH
+        y_m = y_norm - HALF_WIDTH
 
-    # Prędkości graczy w m/s
     if all(sc is not None for sc in slot_s_cols) and len(slot_s_cols) > 0:
-        speeds = atd_df[slot_s_cols].to_numpy(dtype=np.float32)
+        speeds = df[slot_s_cols].to_numpy(dtype=np.float32)
     else:
-        # Wyznaczenie prędkości z różnic skończonych jeśli brak kolumn _s
         vx = np.gradient(x_m, 0.04, axis=0)
         vy = np.gradient(y_m, 0.04, axis=0)
         speeds = np.hypot(vx, vy).astype(np.float32)
 
-    # Pozycja piłki przeskalowana do [-52.5, 52.5] x [-34, 34]
-    bx_raw = atd_df["ball_x"].to_numpy(dtype=np.float32)
-    by_raw = atd_df["ball_y"].to_numpy(dtype=np.float32)
-    if np.nanmax(bx_raw) <= 1.5:
+    bx_raw = df["ball_x"].to_numpy(dtype=np.float32)
+    by_raw = df["ball_y"].to_numpy(dtype=np.float32)
+    if float(np.nanmax(bx_raw)) <= 1.5:
         ball_x = (bx_raw - 0.5) * PITCH_LENGTH
         ball_y = (by_raw - 0.5) * PITCH_WIDTH
     else:
-        # W stage1_tracking.parquet zakres to [0, 105.3] x [0, 68.0]
-        ball_x = bx_raw * (PITCH_LENGTH / 105.3) - HALF_LENGTH
+        ball_x = bx_raw * (PITCH_LENGTH / STAGE1_PITCH_LENGTH) - HALF_LENGTH
         ball_y = by_raw - HALF_WIDTH
 
     return (
@@ -113,16 +128,12 @@ def _compute_mean_interteam_distance_chunked(
     ay: np.ndarray,
     chunk_size: int = 16_384,
 ) -> np.ndarray:
-    """
-    Oblicza średnią odległość pomiędzy wszystkimi widocznymi graczami Home (H) i Away (A)
-    dla każdej klatki w sposób w pełni zwektoryzowany w blokach (chunkach).
-    """
+    """Oblicza średnią odległość H-A wektoryzowanie w blokach pamięci."""
     n_frames = hx.shape[0]
     mean_dist = np.full(n_frames, np.nan, dtype=np.float32)
 
     for start in range(0, n_frames, chunk_size):
         end = min(n_frames, start + chunk_size)
-        # Wymiary: (chunk, n_H, 1) oraz (chunk, 1, n_A) -> (chunk, n_H, n_A)
         dx = hx[start:end, :, None] - ax[start:end, None, :]
         dy = hy[start:end, :, None] - ay[start:end, None, :]
         dist_matrix = np.hypot(dx, dy)
@@ -136,13 +147,24 @@ def _compute_mean_interteam_distance_chunked(
         chunk_res[valid_frames] = dist_sum[valid_frames] / pair_counts[valid_frames]
         mean_dist[start:end] = chunk_res
 
-    # Uzupełnienie ewentualnych pustych klatek wartością mediany
     nan_mask = np.isnan(mean_dist)
     if np.any(nan_mask):
         median_val = float(np.nanmedian(mean_dist)) if not np.all(nan_mask) else 22.0
         mean_dist[nan_mask] = median_val
 
     return mean_dist
+
+
+def _masked_std_axis1(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Wektoryzowane odchylenie standardowe po osi 1 wolne od RuntimeWarning."""
+    count = np.sum(mask, axis=1)
+    safe_count = np.maximum(count, 1)
+    vals = np.where(mask, arr, 0.0)
+    mean = np.sum(vals, axis=1) / safe_count
+    sq_diff = np.where(mask, (arr - mean[:, None]) ** 2, 0.0)
+    var = np.sum(sq_diff, axis=1) / safe_count
+    std = np.sqrt(var)
+    return np.where(count >= 3, std, 999.0).astype(np.float32)
 
 
 def _detect_static_structures_from_slots(
@@ -155,39 +177,28 @@ def _detect_static_structures_from_slots(
     ball_x: np.ndarray,
     ball_y: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Wykrywa uformowania struktur statycznych na boisku (wektoryzacja po macierzach 2D):
-    1. Mur przed rzutem wolnym (free_kick_wall_flag): >= 3 zawodników jednej drużyny
-       w odległości [8.0m, 11.5m] od wolno poruszającej się piłki, skupionych blisko siebie
-       i stojących niemal w miejscu (średnia prędkość < 1.5 m/s).
-    2. Zgrupowanie w polu karnym przed rożnym (corner_box_cluster_flag): >= 6 graczy
-       w jednym polu karnym (|x| >= 36.0m, |y| <= 20.16m) przy niskiej prędkości graczy.
-    """
+    """Wykrywa uformowania struktur statycznych (mur przed wolnym / zgrupowanie w polu karnym)."""
     all_x = np.concatenate([hx, ax], axis=1)
     all_y = np.concatenate([hy, ay], axis=1)
     all_s = np.concatenate([hs, as_], axis=1)
 
-    # 1. Zgrupowanie w polu karnym (pole karne: 16.5m od bramki -> |x| >= 52.5 - 16.5 = 36.0m, |y| <= 20.16m)
+    valid_s = ~np.isnan(all_s)
+    s_count = np.maximum(np.sum(valid_s, axis=1), 1)
+    mean_speed = np.nansum(all_s, axis=1) / s_count
+
     in_left_box = (all_x <= -36.0) & (np.abs(all_y) <= 20.16)
     in_right_box = (all_x >= 36.0) & (np.abs(all_y) <= 20.16)
     n_in_box = np.maximum(np.sum(in_left_box, axis=1), np.sum(in_right_box, axis=1))
-
-    mean_speed = np.nanmean(all_s, axis=1)
-    mean_speed = np.nan_to_num(mean_speed, nan=0.0)
     corner_box_cluster = (n_in_box >= 6) & (mean_speed < 2.2)
 
-    # 2. Mur przed rzutem wolnym: gracze w pierścieniu 8.0 - 11.5m od piłki o prędkości < 1.5 m/s
     dist_h_ball = np.hypot(hx - ball_x[:, None], hy - ball_y[:, None])
     dist_a_ball = np.hypot(ax - ball_x[:, None], ay - ball_y[:, None])
 
     h_in_wall_ring = (dist_h_ball >= 8.0) & (dist_h_ball <= 11.5) & (hs < 1.5)
     a_in_wall_ring = (dist_a_ball >= 8.0) & (dist_a_ball <= 11.5) & (as_ < 1.5)
 
-    # Sprawdzenie zwartości kątowej/przestrzennej graczy w pierścieniu (odchylenie std pozycji Y < 2.5m)
-    hy_wall = np.where(h_in_wall_ring, hy, np.nan)
-    ay_wall = np.where(a_in_wall_ring, ay, np.nan)
-    h_wall_compact = np.nanstd(hy_wall, axis=1) < 2.8
-    a_wall_compact = np.nanstd(ay_wall, axis=1) < 2.8
+    h_wall_compact = _masked_std_axis1(hy, h_in_wall_ring) < 2.8
+    a_wall_compact = _masked_std_axis1(ay, a_in_wall_ring) < 2.8
 
     fk_wall = (
         ((np.sum(h_in_wall_ring, axis=1) >= 3) & h_wall_compact)
@@ -202,123 +213,270 @@ def compute_kinematic_deadball_features(
     raw_atd_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
-    Agreguje wskaźniki braku gry (stanu D) na podstawie danych śledzenia.
-    Obsługuje bezpośrednio 46-slotowy format ATD (raw_atd_df) oraz wzbogacony format
-    stage1_tracking.parquet (stage1_df).
+    Oblicza komplet cech kinematycznych stanu D (5 cech bazowych + 3 cechy Top 1%:
+    - opponent_exclusion_score: reguła dystansu FIFA przy stałych fragmentach gry,
+    - control_void_score: brak zarejestrowanej kontroli piłki z maszyny stanów stage1,
+    - ball_death_flux: dokładny impuls rozpoczęcia stanu D - wyjście piłki za linię lub gwizdek).
     """
     if stage1_df is None and raw_atd_df is None:
         raise ValueError("Należy przekazać przynajmniej jeden z argumentów: stage1_df lub raw_atd_df.")
 
     out = pd.DataFrame({"frame": np.arange(N_FRAMES, dtype=np.int32)})
 
-    # Ścieżka A: Obliczenia bezpośrednio na 46 slotach śledzenia (jeśli przekazano raw_atd_df)
     if raw_atd_df is not None:
         hx, hy, hs, ax, ay, as_, ball_x, ball_y = _extract_slot_arrays_from_raw_atd(raw_atd_df)
         all_speeds = np.concatenate([hs, as_], axis=1)
         valid_mask = ~np.isnan(all_speeds)
         n_visible = np.sum(valid_mask, axis=1)
 
-        # 1. Średnia prędkość wszystkich widocznych zawodników
         speed_sum = np.nansum(all_speeds, axis=1)
-        mean_speed_all = np.where(n_visible > 0, speed_sum / np.maximum(n_visible, 1), 0.0).astype(np.float32)
+        mean_speed_all = np.where(n_visible > 0, speed_sum / np.maximum(n_visible, 1), 0.0).astype(
+            np.float32
+        )
 
-        # 2. Odsetek zawodników poruszających się pieszo (prędkość < 2.0 m/s)
         walking_count = np.sum((all_speeds < 2.0) & valid_mask, axis=1)
-        walking_ratio_2ms = np.where(n_visible > 0, walking_count / np.maximum(n_visible, 1), 1.0).astype(np.float32)
+        walking_ratio_2ms = np.where(
+            n_visible > 0, walking_count / np.maximum(n_visible, 1), 1.0
+        ).astype(np.float32)
 
-        # 3. Brak pressingu mierzony jako średnia odległość między graczami H a A
         no_pressing_dist_m = _compute_mean_interteam_distance_chunked(hx, hy, ax, ay)
 
-        # 4. Flaga wyjścia piłki poza boisko: [-52.5, 52.5] x [-34, 34]
         ball_out_of_bounds = (
             (np.abs(ball_x) > HALF_LENGTH) | (np.abs(ball_y) > HALF_WIDTH)
         ) & (~np.isnan(ball_x))
 
-        # 5. Wykrycie uformowania struktur statycznych (mur / rożny w polu karnym)
         fk_wall, corner_cluster = _detect_static_structures_from_slots(
             hx, hy, hs, ax, ay, as_, ball_x, ball_y
         )
-
-    # Ścieżka B: Wektoryzacja na bazie kolumn z pliku stage1_tracking.parquet
+        ball_x_centered = ball_x
+        ball_y_centered = ball_y
     else:
         df = stage1_df
-        # 1. Średnia prędkość wszystkich widocznych zawodników
         mean_speed_all = df["all_players_mean_speed"].to_numpy(dtype=np.float32)
 
-        # 2. Odsetek zawodników poruszających się pieszo (< 2.0 m/s)
-        # W stage1_tracking 'players_walking_ratio' jest zdefiniowane dla < 1.5 m/s;
-        # skalujemy rozkład z uwzględnieniem średniej prędkości drużyn do progu < 2.0 m/s
         walk_15 = df["players_walking_ratio"].to_numpy(dtype=np.float32)
         speed_factor = np.clip((2.0 - mean_speed_all) * 0.15, 0.0, 0.25)
         walking_ratio_2ms = np.clip(walk_15 + speed_factor, 0.0, 1.0).astype(np.float32)
 
-        # 3. Brak pressingu: estymacja średniej odległości H-A ze środków ciężkości i rozpiętości formacji
-        dx_c = df["home_centroid_x"].to_numpy(dtype=np.float32) - df["away_centroid_x"].to_numpy(dtype=np.float32)
-        dy_c = df["home_centroid_y"].to_numpy(dtype=np.float32) - df["away_centroid_y"].to_numpy(dtype=np.float32)
+        dx_c = df["home_centroid_x"].to_numpy(dtype=np.float32) - df["away_centroid_x"].to_numpy(
+            dtype=np.float32
+        )
+        dy_c = df["home_centroid_y"].to_numpy(dtype=np.float32) - df["away_centroid_y"].to_numpy(
+            dtype=np.float32
+        )
         centroid_dist = np.hypot(dx_c, dy_c)
-        # Uwzględnienie wariancji przestrzennej formacji (length_x = 2*std_x, width_y = 2*std_y)
         var_x = (df["home_length_x"].to_numpy(dtype=np.float32) / 2.0) ** 2 + (
             df["away_length_x"].to_numpy(dtype=np.float32) / 2.0
         ) ** 2
         var_y = (df["home_width_y"].to_numpy(dtype=np.float32) / 2.0) ** 2 + (
             df["away_width_y"].to_numpy(dtype=np.float32) / 2.0
         ) ** 2
-        # Zależność E[||X - Y||] ≈ sqrt(||mu_H - mu_A||^2 + Tr(Sigma_H + Sigma_A))
         no_pressing_dist_m = np.sqrt(centroid_dist**2 + var_x + var_y).astype(np.float32)
 
-        # 4. Flaga wyjścia piłki poza boisko po przeskalowaniu do [-52.5, 52.5] x [-34, 34]
-        # W stage1 ball_x jest w [0, 105.3], ball_y w [0, 68.0]
-        bx_norm = df["ball_x"].to_numpy(dtype=np.float32) / 105.3
-        by_norm = df["ball_y"].to_numpy(dtype=np.float32) / 68.0
-        ball_x_centered = (bx_norm - 0.5) * PITCH_LENGTH
-        ball_y_centered = (by_norm - 0.5) * PITCH_WIDTH
+        # Fuzja pozycji piłki: wykorzystanie brd_ball_x / brd_ball_y gdy piłka taktyczna ma lukę
+        bx_m = df["ball_x"].to_numpy(dtype=np.float32)
+        by_m = df["ball_y"].to_numpy(dtype=np.float32)
+        if {"brd_ball_x", "brd_ball_y", "brd_valid", "ball_status_code"}.issubset(df.columns):
+            brd_bx = df["brd_ball_x"].to_numpy(dtype=np.float32)
+            brd_by = df["brd_ball_y"].to_numpy(dtype=np.float32)
+            brd_ok = (
+                (df["brd_valid"].to_numpy(dtype=np.int8) == 1)
+                & (~np.isnan(brd_bx))
+                & (~np.isnan(brd_by))
+            )
+            tac_latent = df["ball_status_code"].to_numpy(dtype=np.int8) > 0
+            bx_m = np.where(tac_latent & brd_ok, brd_bx, bx_m)
+            by_m = np.where(tac_latent & brd_ok, brd_by, by_m)
 
-        oob_geom = (np.abs(ball_x_centered) >= HALF_LENGTH - 0.05) | (
-            np.abs(ball_y_centered) >= HALF_WIDTH - 0.05
+        # Przeskalowanie z [0, 105.3] x [0, 68.0] do [-52.5, 52.5] x [-34.0, 34.0]
+        ball_x_centered = (bx_m / STAGE1_PITCH_LENGTH - 0.5) * PITCH_LENGTH
+        ball_y_centered = (by_m / PITCH_WIDTH - 0.5) * PITCH_WIDTH
+
+        oob_geom = (np.abs(ball_x_centered) >= HALF_LENGTH - 0.08) | (
+            np.abs(ball_y_centered) >= HALF_WIDTH - 0.08
         )
         near_bound = df["ball_near_boundary"].to_numpy(dtype=np.int8) > 0
-        ball_out_of_bounds = oob_geom | (near_bound & (df["ball_speed"].to_numpy(dtype=np.float32) < 1.5))
+        ball_out_of_bounds = oob_geom | (
+            near_bound & (df["ball_speed"].to_numpy(dtype=np.float32) < 1.6)
+        )
 
-        # 5. Wykrycie uformowania struktur statycznych (mur przed wolnym / zgrupowanie przed rożnym)
+        if {"brd_valid", "brd_lookat_x", "brd_lookat_y", "brd_lookat_speed_ms"}.issubset(df.columns):
+            b_val = df["brd_valid"].to_numpy(dtype=np.int8) == 1
+            b_lx = (df["brd_lookat_x"].to_numpy(dtype=np.float32) / STAGE1_PITCH_LENGTH - 0.5) * PITCH_LENGTH
+            b_ly = (df["brd_lookat_y"].to_numpy(dtype=np.float32) / PITCH_WIDTH - 0.5) * PITCH_WIDTH
+            b_lspd = df["brd_lookat_speed_ms"].to_numpy(dtype=np.float32)
+            tv_at_boundary = (
+                b_val
+                & (b_lspd < 2.0)
+                & ((np.abs(b_lx) >= HALF_LENGTH - 3.5) | (np.abs(b_ly) >= HALF_WIDTH - 2.5))
+                & (walking_ratio_2ms >= 0.60)
+            )
+            ball_out_of_bounds = ball_out_of_bounds | (tv_at_boundary & near_bound)
+
         in_box = df["players_in_penalty_box"].to_numpy(dtype=np.int8)
         ball_stat = df["ball_stationary_frames"].to_numpy(dtype=np.int16)
 
         corner_cluster = (in_box >= 6) & (ball_stat >= 10) & (walking_ratio_2ms >= 0.60)
 
-        # Mur przed rzutem wolnym: piłka nieruchoma (>15 klatek), wysoki odsetek stojących graczy,
-        # brak bezpośredniej walki o piłkę (is_contested == 0), a 2. i 3. gracz w pobliżu ~9-11m
         not_contested = df["is_contested"].to_numpy(dtype=np.int8) == 0
         h_n2 = df["home_near2_dist_m"].to_numpy(dtype=np.float32)
         a_n2 = df["away_near2_dist_m"].to_numpy(dtype=np.float32)
         wall_dist_proxy = ((h_n2 >= 7.5) & (h_n2 <= 12.0)) | ((a_n2 >= 7.5) & (a_n2 <= 12.0))
         fk_wall = (ball_stat >= 15) & not_contested & wall_dist_proxy & (walking_ratio_2ms >= 0.65)
 
+    # Dodatkowe cechy Top 1% wyliczane na podstawie stage1_df (lub bezpieczne domyślne gdy brak)
+    opponent_exclusion_score = np.zeros(N_FRAMES, dtype=np.float32)
+    control_void_score = np.zeros(N_FRAMES, dtype=np.float32)
+    ball_death_flux = np.zeros(N_FRAMES, dtype=np.float32)
+    kickoff_setup_flag = np.zeros(N_FRAMES, dtype=bool)
+    goal_kick_setup_flag = np.zeros(N_FRAMES, dtype=bool)
+
+    if stage1_df is not None:
+        df = stage1_df
+        h_n1 = df["home_near1_dist_m"].to_numpy(dtype=np.float32)
+        a_n1 = df["away_near1_dist_m"].to_numpy(dtype=np.float32)
+        h_in3 = df["home_in_3m"].to_numpy(dtype=np.int8)
+        a_in3 = df["away_in_3m"].to_numpy(dtype=np.int8)
+        ball_stat_f = df["ball_stationary_frames"].to_numpy(dtype=np.float32)
+        ball_spd = df["ball_speed"].to_numpy(dtype=np.float32)
+        near_bound_f = df["ball_near_boundary"].to_numpy(dtype=np.int8) > 0
+        is_cont = df["is_contested"].to_numpy(dtype=np.int8) > 0
+
+        # 1. Prawo strefy wykluczenia FIFA (Opponent Exclusion Zone wokół stojącej/wolnej piłki):
+        # Wykonawca jest blisko (< 2.5m), ale rywal szanuje dystans stałego fragmentu (> 4.0m..9.15m)
+        min_d = np.minimum(h_n1, a_n1)
+        max_d = np.maximum(h_n1, a_n1)
+        one_team_in3 = ((h_in3 >= 1) & (a_in3 == 0)) | ((a_in3 >= 1) & (h_in3 == 0))
+        opp_respects_dist = np.clip((max_d - 3.5) / 5.5, 0.0, 1.0)
+        taker_ready = np.clip((3.0 - min_d) / 1.8, 0.0, 1.0)
+        ball_slow_or_stat = np.clip(ball_stat_f / 15.0, 0.0, 1.0) * (ball_spd < 2.0)
+
+        opponent_exclusion_score = (
+            opp_respects_dist * (0.6 * taker_ready + 0.4 * one_team_in3) * ball_slow_or_stat
+        ).astype(np.float32)
+
+        # 2. Control Void Score z maszyny stanów posiadania Stage 1:
+        # Gdy od dawna nie było potwierdzonego kontaktu (frames_since_last_control rośnie), a gracze chodzą
+        if "frames_since_last_control" in df.columns:
+            fslc = df["frames_since_last_control"].to_numpy(dtype=np.float32)
+            control_void_score = (
+                np.clip((fslc - 25.0) / 75.0, 0.0, 1.0)
+                * np.clip((walking_ratio_2ms - 0.30) / 0.45, 0.0, 1.0)
+            ).astype(np.float32)
+
+        # 3. Wykrycie specyficznych struktur: Kick-off (środek boiska + separacja połów) i Goal Kick (5.5m)
+        if {"home_centroid_x_norm", "away_centroid_x_norm"}.issubset(df.columns):
+            h_cxn = df["home_centroid_x_norm"].to_numpy(dtype=np.float32)
+            a_cxn = df["away_centroid_x_norm"].to_numpy(dtype=np.float32)
+            ball_near_center = (np.abs(ball_x_centered) < 3.5) & (np.abs(ball_y_centered) < 3.5)
+            halves_separated = (h_cxn < 51.5) & (a_cxn > 53.5)
+            kickoff_setup_flag = ball_near_center & halves_separated & (walking_ratio_2ms > 0.65)
+
+        if {"home_gk_dist_m", "away_gk_dist_m"}.issubset(df.columns):
+            gk_near = np.minimum(
+                df["home_gk_dist_m"].to_numpy(dtype=np.float32),
+                df["away_gk_dist_m"].to_numpy(dtype=np.float32),
+            ) < 4.0
+            in_goal_area = (np.abs(ball_x_centered) >= HALF_LENGTH - 7.5) & (
+                np.abs(ball_y_centered) <= 11.0
+            )
+            goal_kick_setup_flag = gk_near & in_goal_area & (ball_stat_f >= 10) & (max_d > 8.0)
+
+        # 4. Ball Death Flux (Impuls początku stanu D - przekroczenie linii boiska lub gwizdek po faulu):
+        # Moment wejścia piłki w strefę przygraniczną/aut (narastające zbocze ball_near_boundary / ball_out_of_bounds)
+        oob_int = (ball_out_of_bounds | near_bound_f).astype(np.int8)
+        oob_onset = (oob_int == 1) & (np.roll(oob_int, 1) == 0)
+        oob_onset[0] = False
+        # Rozmycie impulsu wyjścia na aut o ±4 klatki
+        oob_flux = np.convolve(oob_onset.astype(np.float32), np.hanning(9), mode="same")
+
+        # Moment gwizdka po faulu/zwarciu: wcześniej bezpośrednia walka (is_contested w ostatnich 35 klatkach),
+        # po której następuje wyhamowanie prędkości wszystkich graczy i stacjonarność piłki
+        recent_contest = (
+            np.convolve(is_cont.astype(np.float32), np.ones(35, dtype=np.float32) / 35.0, mode="same")
+            > 0.15
+        )
+        speed_drop = np.maximum(0.0, np.roll(mean_speed_all, 25) - mean_speed_all)
+        speed_drop[:25] = 0.0
+        whistle_flux = np.where(
+            recent_contest,
+            np.clip(speed_drop / 1.5, 0.0, 1.0) * np.clip(walking_ratio_2ms, 0.0, 1.0),
+            0.0,
+        )
+
+        ball_death_flux = np.clip(0.75 * oob_flux + 0.55 * whistle_flux, 0.0, 1.5).astype(np.float32)
+
+    static_structure_flag = (
+        fk_wall | corner_cluster | kickoff_setup_flag | goal_kick_setup_flag
+    ).astype(bool)
+
     out["mean_speed_all"] = mean_speed_all
     out["walking_ratio_2ms"] = walking_ratio_2ms
     out["no_pressing_dist_m"] = no_pressing_dist_m
     out["ball_out_of_bounds"] = ball_out_of_bounds.astype(bool)
+    out["ball_x_centered"] = ball_x_centered.astype(np.float32)
+    out["ball_y_centered"] = ball_y_centered.astype(np.float32)
     out["free_kick_wall_flag"] = fk_wall.astype(bool)
     out["corner_box_cluster_flag"] = corner_cluster.astype(bool)
-    out["static_structure_flag"] = (fk_wall | corner_cluster).astype(bool)
+    out["static_structure_flag"] = static_structure_flag
+    out["opponent_exclusion_score"] = opponent_exclusion_score
+    out["control_void_score"] = control_void_score
+    out["ball_death_flux"] = ball_death_flux
 
-    # Syntetyczny wynik kinematyczny stanu D (kinematic_d_score w [0, 1])
+    # Syntetyczny wynik kinematyczny stanu D
     s_speed = np.clip((3.2 - mean_speed_all) / 2.0, 0.0, 1.0)
     s_walk = np.clip((walking_ratio_2ms - 0.35) / 0.50, 0.0, 1.0)
-    # Brak pressingu w okolicach wznowień: duża separacja lub brak bezpośredniej walki o piłkę
     s_press = np.clip((no_pressing_dist_m - 14.0) / 14.0, 0.0, 1.0)
-    s_oob = ball_out_of_bounds.astype(np.float32) * 0.45
-    s_struct = out["static_structure_flag"].to_numpy(dtype=np.float32) * 0.35
+    s_oob = ball_out_of_bounds.astype(np.float32) * 0.42
+    s_struct = static_structure_flag.astype(np.float32) * 0.30
+    s_excl = opponent_exclusion_score * 0.30
+    s_void = control_void_score * 0.25
 
-    raw_score = 0.30 * s_speed + 0.35 * s_walk + 0.15 * s_press + s_oob + s_struct
+    raw_score = (
+        0.25 * s_speed
+        + 0.30 * s_walk
+        + 0.12 * s_press
+        + s_oob
+        + s_struct
+        + s_excl
+        + s_void
+    )
 
     if stage1_df is not None:
-        # Wzmocnienie o stacjonarność piłki i brak rywalizacji z stage1_tracking.parquet
-        stat_norm = np.clip(stage1_df["ball_stationary_frames"].to_numpy(dtype=np.float32) / 35.0, 0.0, 1.0)
+        stat_norm = np.clip(
+            stage1_df["ball_stationary_frames"].to_numpy(dtype=np.float32) / 35.0, 0.0, 1.0
+        )
         uncontested = 1.0 - stage1_df["is_contested"].to_numpy(dtype=np.float32)
+
+        if "ball_to_brd_lookat_dist_m" in stage1_df.columns and "brd_valid" in stage1_df.columns:
+            look_dist = stage1_df["ball_to_brd_lookat_dist_m"].to_numpy(dtype=np.float32)
+            b_val = stage1_df["brd_valid"].to_numpy(dtype=np.int8) == 1
+            tac_inferred = stage1_df["ball_status_code"].to_numpy(dtype=np.int8) == 2
+            stat_trust = np.where(b_val & tac_inferred & (look_dist > 18.0), 0.35, 1.0).astype(
+                np.float32
+            )
+            stat_norm *= stat_trust
+
         raw_score = 0.65 * raw_score + 0.25 * stat_norm + 0.10 * uncontested
 
-    # Wygładzenie przyczynowo-symetryczne filtrem kroczącym (1.0s = 25 klatek), aby uniknąć szpilkowych drgań
-    kernel = np.ones(25, dtype=np.float32) / 25.0
+        # Silne stłumienie, gdy trwa aktywna seria podań/kontaktów jednej drużyny w żywej grze
+        if {"home_consecutive_touches", "away_consecutive_touches", "frames_since_last_control"}.issubset(
+            stage1_df.columns
+        ):
+            max_touches = np.maximum(
+                stage1_df["home_consecutive_touches"].to_numpy(dtype=np.int16),
+                stage1_df["away_consecutive_touches"].to_numpy(dtype=np.int16),
+            )
+            fslc = stage1_df["frames_since_last_control"].to_numpy(dtype=np.int32)
+            active_possession_chain = (max_touches >= 2) & (fslc <= 25) & (~ball_out_of_bounds)
+            raw_score = np.where(active_possession_chain, raw_score * 0.40, raw_score)
+
+        if "brd_is_replay" in stage1_df.columns:
+            brd_rep = stage1_df["brd_is_replay"].to_numpy(dtype=np.int8) == 1
+            players_slow = mean_speed_all < 2.65
+            raw_score = np.where(brd_rep & players_slow, np.maximum(raw_score, 0.88), raw_score)
+
+    kernel = np.ones(19, dtype=np.float32) / 19.0
     smooth_score = np.convolve(np.clip(raw_score, 0.0, 1.0), kernel, mode="same")
     out["kinematic_d_score"] = np.clip(smooth_score, 0.0, 1.0).astype(np.float32)
 
