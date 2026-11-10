@@ -1,5 +1,5 @@
 # Krótki opis tego co się dzieje na tej gałęzi
-**NOTE! :** To jest narazie szkic dokumentacji. Będzie to jeszcze poprawiane i dopieszczane (i przetłumaczone na ang) ;)
+**NOTE! :** To jest szkic dokumentacji. Będzie to jeszcze poprawiane i dopieszczane (i przetłumaczone na ang)
 
 ***Overview problemu w tym module :*** Estymacja posiadania piłki w zaszumionym wideo na podstawie danych wejściowych z systemów śledzenia.
 
