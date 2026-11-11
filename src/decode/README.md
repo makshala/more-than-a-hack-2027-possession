@@ -75,6 +75,22 @@ Dla każdej kolejnej klatki $t$ i dla każdego możliwego stanu docelowego $j$, 
 
 $$V_{t, j} = \max_{i=1 \dots N} \left( V_{t-1, i} \cdot A_{ij} \right) \cdot B_j(O_t)$$
 
+Zapisywana jest wyłącznie wartość z tej ścieżki, która dała najwyższy wyniki. Indeks stanu $i$, który doprowadził do tego maksimum jest zapisywany do tablicy śledzącej aby można było wykonać *backtracking*.
+
+Po przetworzeniu całej sekwencji algorytm analizuje ostatnią kolumnę $V_{T, j}$. Wybiera stan końcowy, który zgromadził najwyższe łączne prawdopodobieństwo: 
+
+$$S_T^* = \arg\max_{j=1 \dots N} (V_{T, j})$$
+
+Mając wyznaczony optymalny stan końcowy $S_T^*$, algorytm cofa się iteracyjnie po osi czasu, korzystając z tablicy wskaźników wstecznych:
+
+$$S_t^* = Ptr_{t+1, S_{t+1}^*}$$
+
+Odczytanie tych referencji od punktu $T$ do $1$ wydobywa jedną spójną ścieżkę stanów systematycznie pozbawioną szumu i nielogicznych przeskoków.
+
+**NOTE! :** Mnożenie przez siebie setek tysięcy wartości prawdopodobieństw, które są wartościami z przedziału (0.0 - 1.0) powoduje tak zwany underflow, który sprowadza wartość zmiennoprzecinkową do zera. Dlatego niezbędne jest mnożenie wartości prawdopodobieństw na logarytmach naturalnych, gdzie operacje mnożenia zamieniają się na sumowanie, a własności maksimum pozostają takie same bo funkcja logarytmiczna jest funkcją rosnącą : 
+
+$$V_{t, j} = \max_{i} \left( V_{t-1, i} + \log A_{ij} \right) + \log B_j(O_t)$$
+
 ## Opis plików
 `config.py` - Definiuje globalne stałe, które będą używane w całym projekcie. 
 
