@@ -1,3 +1,4 @@
+
 # Krótki opis tego co się dzieje na tej gałęzi
 **NOTE! :** To jest szkic dokumentacji. Będzie to jeszcze poprawiane i dopieszczane (i przetłumaczone na ang)
 
@@ -8,7 +9,14 @@
 ***Co chce osiągnąć :*** Ograniczenie krótkich, przypadkowych przeskoków etykiet spowodowanych błędami predykcji ale przy jednoczesnym braniu pod uwagę faktycznych krótkich zmian posiadania.
 
 ### *Ukryte Modele Markowa*
-Ukryte Modele Margowa (HMM - Hidden Markov Models) to model matematyczny, który pozwala wnioskować o ukrytym stanie systemu na podstawie obserwowanych danych. Właściwość Markowa polega na tym, że prawdopodobieństwo kolejnego stanu zależy od aktualnego stanu a nie od całej historii wcześniejszych stanów. Przykładowo jeżeli w danej klatce piłkę ma `H`, to w następnej klatce prawdopodobieństwo zostania przy `H` może być wysokie. HMM opiera się na dwóch rodzajach informacji: 
+Ukryte Modele Markowa (HMM - Hidden Markov Models) to model matematyczny, który pozwala wnioskować o ukrytym stanie systemu na podstawie obserwowanych danych. Właściwość Markowa polega na tym, że prawdopodobieństwo kolejnego stanu zależy od aktualnego stanu a nie od całej historii wcześniejszych stanów. Jest prosty wzór, który matematycznie opisuje tę zależność
+
+
+$$
+p_{ij}^{(n)} = P(E_j^{(n)} \mid E_i^{(n-1)})
+$$
+
+Przykładowo jeżeli w danej klatce piłkę ma `H`, to w następnej klatce prawdopodobieństwo zostania przy `H` może być wysokie. HMM opiera się na dwóch rodzajach informacji: 
 
 1) ***Prawdopodobieństwo przejścia (Transition Probability)***
 
@@ -20,6 +28,8 @@ Określa jakie jest prawdopodobieństwo przejścia z jednego stanu do drugiego. 
 | **H** | 0.90 | 0.05 | 0.05 |
 | **A** | 0.05 | 0.90 | 0.05 |
 | **D** | 0.40 | 0.40 | 0.20 |
+
+
 
 2) ***Prawdopodobieństwo emisji (Emission Probability)***
 
@@ -44,15 +54,15 @@ HMM pozwala uwzględnić nie tylko prawdopodobieństwa obserwacji, ale również
 
 Podsumowując HMM analizuję sekwencję jako całość, a nie każdą klatkę całkowicie niezależnie. 
 
-
-
-
-
-
-
 ## Opis plików
 `config.py` - Definiuje globalne stałe, które będą używane w całym projekcie. 
 
 `generator.py` - Tutaj są generowane dane wejściowe, które symulują to co będzie wynikiem modelu Janka. 
 
-`viterbi_decoder.py` - Realizuje algorytm *Viterbiego* dla *Ukrytych Modeli Markowa (HMM)* operujący na logarytmach. r
+`viterbi_decoder.py` - Realizuje algorytm *Viterbiego* dla *Ukrytych Modeli Markowa (HMM)* operujący na logarytmach. 
+
+
+```math
+p_{ij}^{(n)} = P(E_j^{(n)} \(\mid\) E_i^{(n-1)})
+```
+
