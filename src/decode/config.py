@@ -112,12 +112,17 @@ def normalize_probabilities_df(df: Any, fps: float = DEFAULT_FPS) -> Any:
 # 3. Physical Possession Constraints (Stored in Absolute Milliseconds)
 # -----------------------------------------------------------------------------
 # In professional football, true possession transfers require ball control/touches
-# which physically take at least 600-800 ms. Sub-second flickers are tracking artifacts.
+# which physically take at least 800-1000 ms. Sub-second flickers are tracking artifacts.
 PHYSICAL_MIN_DURATIONS_MS: Dict[int, float] = {
-    STATE_HOME: 800.0,       # Min 800 ms to establish controlled home possession
-    STATE_AWAY: 800.0,       # Min 800 ms to establish controlled away possession
-    STATE_DEAD_BALL: 400.0   # Min 400 ms for whistle/out-of-bounds/stoppage
+    STATE_HOME: 1000.0,       # Min 1000 ms (25 frames at 25 fps) to establish controlled home possession
+    STATE_AWAY: 1000.0,       # Min 1000 ms (25 frames at 25 fps) to establish controlled away possession
+    STATE_DEAD_BALL: 600.0    # Min 600 ms (15 frames at 25 fps) for whistle/out-of-bounds/stoppage
 }
+
+# Maximum duration of a transient interruption to bridge in sandwich merging (e.g. H H A H H -> H H H H H)
+# In tactical analysis, a 1.0-1.6s flicker where possession immediately reverts to the original team
+# is a contested duel/touch, not a new controlled tactical possession spell.
+SANDWICH_MERGE_MAX_MS: float = 1600.0
 
 # Empirical tactical football duration priors (mean and standard deviation in ms)
 # Derived from elite professional match statistics (e.g. StatsBomb / Wyscout data).
