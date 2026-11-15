@@ -52,10 +52,8 @@ CONFIG: dict[str, Any] = {
         "random_state": 42,
     },
 
-    # Time-based constants are canonical. Derive frame counts for the relevant
-    # sampling rate instead of reusing 25-FPS frame counts on 10-FPS data.
     "physical_and_temporal": {
-        "short_gap_max_s": 1.0,       # formerly 25 frames at 25 FPS
+        "short_gap_max_s": 1.0,
         "contested_radius_m": 2.5,
         "control_radius_m": 3.0,
         "support_radius_m": 5.0,
@@ -65,24 +63,19 @@ CONFIG: dict[str, Any] = {
         "player_max_speed_m_s": 7.50,
         "pitch_control_tau_s": 0.50,
         "max_ball_speed_m_s": 38.0,
-        "savgol_window_s": 0.28,       # 7 samples at the target 25 FPS
+        "savgol_window_s": 0.28,
         "savgol_poly": 2,
     },
 
-    # Full target-match Parquet: all engineered/context columns remain available
-    # to the later decoder. Do not reduce this table to the 37 Role 4 features.
     "full_match_parquet": {
         "expected_columns": 111,
-        # A single-match competition Parquet may not carry match_id. In that
-        # case inference treats the file as one match, but a separate Role 3
-        # join must still be unambiguous.
         "match_id_column": "match_id",
         "match_id_aliases": ("matchId", "game_id", "gameId", "fixture_id"),
         "allow_single_match_without_match_id": True,
-        # In the currently used 111-column competition Parquet the physical
-        # frame key is often named `frame`; `frame_id` remains a supported alias.
         "frame_id_column": "frame",
-        "frame_id_aliases": ("frame_id", "frame_idx", "frame_index", "frame_number", "frame_num"),
+        "frame_id_aliases": (
+            "frame_id", "frame_idx", "frame_index", "frame_number", "frame_num"
+        ),
         "allow_row_order_without_frame_id": False,
         "timestamp_column": "timestamp_s",
         "period_column": "period",
@@ -103,8 +96,6 @@ CONFIG: dict[str, Any] = {
         ),
     },
 
-    # Role 4 training contract. Model feature names are sourced from the V3
-    # manifest; they are intentionally not duplicated/hard-coded here.
     "role4_training": {
         "enabled": True,
         "training_dataset": "skillcorner_training_v3.parquet",
@@ -159,7 +150,7 @@ CONFIG: dict[str, Any] = {
                 "l2_regularization": 1.0,
                 "early_stopping": False,
             },
-            "max_nan_ratio_per_feature": 1.0,  # report NaN; do not reject solely for NaN
+            "max_nan_ratio_per_feature": 1.0,
             "reject_infinite_values": True,
         },
         "evaluation": {
@@ -181,7 +172,10 @@ CONFIG: dict[str, Any] = {
             "home_probability_column": "p_home_ha",
             "away_probability_column": "p_away_ha",
             "probabilities_sum_to_one": True,
-            "probability_semantics": "conditional_over_the_binary_HA_training_label_space; not automatically calibrated as P(team|ball_in_play)",
+            "probability_semantics": (
+                "conditional_over_the_binary_HA_training_label_space; "
+                "not automatically calibrated as P(team|ball_in_play)"
+            ),
         },
         "artifacts_directory": "role4_artifacts",
         "artifacts": (
@@ -193,9 +187,6 @@ CONFIG: dict[str, Any] = {
         ),
     },
 
-    # Routing for the 111-column target-match feature set.
-    # Role 4 consumes only the 37 manifest-matched inputs. Everything else is
-    # retained for Role 5 and should not be silently discarded.
     "feature_routing": {
         "role4_ml_inputs": {
             "source": "role4_training.feature_manifest",
@@ -226,10 +217,6 @@ CONFIG: dict[str, Any] = {
         "recompute_tracking_or_homography": False,
     },
 
-    # Role 4 evidence fusion: deterministic, bounded domain rules using
-    # competition-only columns. HGB remains unchanged and still consumes only
-    # the 37 SkillCorner features. None of the weights below are fitted on the
-    # target match. Correlated features are grouped and capped.
     "role4_evidence_fusion": {
         "version": "v2",
         "enabled": True,
@@ -255,11 +242,12 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.20,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    # frames_since_last_control is measured in target-match frames;
-                    # tau=75 frames corresponds to 3 seconds at 25 FPS.
                     {"kind": "exp_decay", "column": "frames_since_last_control", "scale": 75.0},
                 ),
-                "sign_semantics": "1=Home, -1=Away, 0=neutral; freshness decays over 3 seconds at 25 FPS",
+                "sign_semantics": (
+                    "1=Home, -1=Away, 0=neutral; "
+                    "freshness decays over 3 seconds at 25 FPS"
+                ),
             },
             {
                 "name": "consecutive_touches_balance",
@@ -271,10 +259,16 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.12,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {"kind": "category_map", "column": "ball_status_code", "mapping": {0: 1.0, 1: 0.70, 2: 0.35}},
+                    {
+                        "kind": "category_map",
+                        "column": "ball_status_code",
+                        "mapping": {0: 1.0, 1: 0.70, 2: 0.35},
+                    },
                     {"kind": "exp_decay", "column": "ball_sigma_m", "scale": 4.0},
                 ),
-                "sign_semantics": "home_consecutive_touches - away_consecutive_touches; positive=Home",
+                "sign_semantics": (
+                    "home_consecutive_touches - away_consecutive_touches; positive=Home"
+                ),
             },
             {
                 "name": "causal_control_diff_2s",
@@ -285,10 +279,16 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.12,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {"kind": "category_map", "column": "ball_status_code", "mapping": {0: 1.0, 1: 0.70, 2: 0.35}},
+                    {
+                        "kind": "category_map",
+                        "column": "ball_status_code",
+                        "mapping": {0: 1.0, 1: 0.70, 2: 0.35},
+                    },
                     {"kind": "exp_decay", "column": "ball_sigma_m", "scale": 4.0},
                 ),
-                "sign_semantics": "CONFIRMED: positive=Home advantage; negative=Away advantage",
+                "sign_semantics": (
+                    "CONFIRMED: positive=Home advantage; negative=Away advantage"
+                ),
             },
             {
                 "name": "causal_control_diff_4s",
@@ -299,10 +299,16 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.08,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {"kind": "category_map", "column": "ball_status_code", "mapping": {0: 1.0, 1: 0.70, 2: 0.35}},
+                    {
+                        "kind": "category_map",
+                        "column": "ball_status_code",
+                        "mapping": {0: 1.0, 1: 0.70, 2: 0.35},
+                    },
                     {"kind": "exp_decay", "column": "ball_sigma_m", "scale": 4.0},
                 ),
-                "sign_semantics": "CONFIRMED: positive=Home advantage; negative=Away advantage",
+                "sign_semantics": (
+                    "CONFIRMED: positive=Home advantage; negative=Away advantage"
+                ),
             },
             {
                 "name": "smart_tagging_team_prior",
@@ -317,13 +323,13 @@ CONFIG: dict[str, Any] = {
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
                     {"kind": "min_ratio", "column": "st_n_active_tags", "scale": 2.0},
-                    # Video-tag votes are suppressed when broadcast is invalid,
-                    # replay is active, or ball is outside the camera FOV.
                     {"kind": "binary", "column": "brd_valid", "on_value": 1},
                     {"kind": "binary", "column": "brd_is_replay", "on_value": 0},
                     {"kind": "binary", "column": "ball_in_camera_fov", "on_value": 1},
                 ),
-                "sign_semantics": "1=Home, -1=Away, 0=neutral; tag-count and live-broadcast reliability gates",
+                "sign_semantics": (
+                    "1=Home, -1=Away, 0=neutral; tag-count and live-broadcast reliability gates"
+                ),
             },
             {
                 "name": "smart_tagging_team_score",
@@ -339,7 +345,9 @@ CONFIG: dict[str, Any] = {
                     {"kind": "binary", "column": "brd_is_replay", "on_value": 0},
                     {"kind": "binary", "column": "ball_in_camera_fov", "on_value": 1},
                 ),
-                "sign_semantics": "CONFIRMED BY FEATURE DESCRIPTION: positive tag-vote difference favors Home; live-broadcast reliability gates",
+                "sign_semantics": (
+                    "CONFIRMED BY FEATURE DESCRIPTION: positive tag-vote difference favors Home"
+                ),
             },
             {
                 "name": "near1_distance_leadlag_04s",
@@ -350,11 +358,23 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.08,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {"kind": "category_map", "column": "ball_status_code", "mapping": {0: 1.0, 1: 0.70, 2: 0.35}},
+                    {
+                        "kind": "category_map",
+                        "column": "ball_status_code",
+                        "mapping": {0: 1.0, 1: 0.70, 2: 0.35},
+                    },
                     {"kind": "exp_decay", "column": "ball_sigma_m", "scale": 4.0},
-                    {"kind": "pair_min_ratio", "home_column": "home_n_visible", "away_column": "away_n_visible", "scale": 8.0},
+                    {
+                        "kind": "pair_min_ratio",
+                        "home_column": "home_n_visible",
+                        "away_column": "away_n_visible",
+                        "scale": 8.0,
+                    },
                 ),
-                "sign_semantics": "ASSUMPTION: positive=Home, inferred from near1_dist_diff_m=(Away distance - Home distance); verify source transform",
+                "sign_semantics": (
+                    "ASSUMPTION: positive=Home, inferred from base distance-difference feature; "
+                    "verify transform"
+                ),
             },
             {
                 "name": "near1_distance_leadlag_10s",
@@ -365,11 +385,23 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.05,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {"kind": "category_map", "column": "ball_status_code", "mapping": {0: 1.0, 1: 0.70, 2: 0.35}},
+                    {
+                        "kind": "category_map",
+                        "column": "ball_status_code",
+                        "mapping": {0: 1.0, 1: 0.70, 2: 0.35},
+                    },
                     {"kind": "exp_decay", "column": "ball_sigma_m", "scale": 4.0},
-                    {"kind": "pair_min_ratio", "home_column": "home_n_visible", "away_column": "away_n_visible", "scale": 8.0},
+                    {
+                        "kind": "pair_min_ratio",
+                        "home_column": "home_n_visible",
+                        "away_column": "away_n_visible",
+                        "scale": 8.0,
+                    },
                 ),
-                "sign_semantics": "ASSUMPTION: positive=Home, inferred from near1_dist_diff_m=(Away distance - Home distance); verify source transform",
+                "sign_semantics": (
+                    "ASSUMPTION: positive=Home, inferred from base distance-difference feature; "
+                    "verify transform"
+                ),
             },
             {
                 "name": "pitch_control_leadlag_04s",
@@ -380,9 +412,17 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.08,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {"kind": "pair_min_ratio", "home_column": "home_n_visible", "away_column": "away_n_visible", "scale": 8.0},
+                    {
+                        "kind": "pair_min_ratio",
+                        "home_column": "home_n_visible",
+                        "away_column": "away_n_visible",
+                        "scale": 8.0,
+                    },
                 ),
-                "sign_semantics": "ASSUMPTION: positive change means increasing Home pitch control; verify source transform",
+                "sign_semantics": (
+                    "ASSUMPTION: positive change means increasing Home pitch control; "
+                    "verify source transform"
+                ),
             },
             {
                 "name": "pitch_control_leadlag_10s",
@@ -393,14 +433,19 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.05,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {"kind": "pair_min_ratio", "home_column": "home_n_visible", "away_column": "away_n_visible", "scale": 8.0},
+                    {
+                        "kind": "pair_min_ratio",
+                        "home_column": "home_n_visible",
+                        "away_column": "away_n_visible",
+                        "scale": 8.0,
+                    },
                 ),
-                "sign_semantics": "ASSUMPTION: positive change means increasing Home pitch control; verify source transform",
+                "sign_semantics": (
+                    "ASSUMPTION: positive change means increasing Home pitch control; "
+                    "verify source transform"
+                ),
             },
         ),
-        # These are deliberately routed as context for Role 5, not H/A votes.
-        # A team taking a restart is not necessarily in possession before the
-        # ball becomes live; goalkeeper signals already belong to HGB features.
         "context_only_columns": (
             "st_restart_team",
             "st_set_piece",
@@ -447,26 +492,24 @@ CONFIG: dict[str, Any] = {
         ),
     },
 
-    # Role 3 produces P(D). Semantics must be agreed between Role 3 and Role 5.
     "role3_output": {
-        "probability_column": "p_dead",
+        "probability_column": "p_dead_ball",
         "expected_range": (0.0, 1.0),
-        # Set to 'out_of_play_only' only after Role 3 confirms this exact meaning.
-        # Do not use the fusion formula if this includes contested in-play frames.
         "confirmed_semantics": None,
         "required_semantics_for_fusion": "out_of_play_only",
     },
 
-    # Probability-level combination. Kept disabled until the Role 3 semantic
-    # handshake is confirmed. No learned calibration is fitted on the target.
     "probability_fusion": {
         "enabled": False,
         "method": "conditional_live_mass_scaling",
-        "assumption": "Role4 H/A probabilities must be a defensible approximation of team possession conditional on live play; Role3 must output P(ball_out_of_play). This is not guaranteed merely by binary H/A training.",
+        "assumption": (
+            "Role4 H/A probabilities must be a defensible approximation of team possession conditional on live play; "
+            "Role3 must output P(ball_out_of_play). This is not guaranteed merely by binary H/A training."
+        ),
         "formulas": {
-            "p_home": "(1 - p_dead) * p_home_ha",
-            "p_away": "(1 - p_dead) * p_away_ha",
-            "p_dead": "p_dead",
+            "p_home": "(1 - p_dead_ball) * p_home_ha",
+            "p_away": "(1 - p_dead_ball) * p_away_ha",
+            "p_dead_ball": "p_dead_ball",
         },
         "require_role3_semantics_confirmation": True,
         "role4_conditional_semantics_confirmed": False,
@@ -474,13 +517,11 @@ CONFIG: dict[str, Any] = {
         "contested_in_play_is_dead_ball": False,
         "sum_to_one_tolerance": 1e-9,
         "require_finite_probabilities": True,
-        "clip_input_probabilities": False,  # out-of-range input should raise, not be silently fixed
+        "clip_input_probabilities": False,
     },
 
-    # Role 5 is the spell-level decoder. Thresholds are deliberately unset:
-    # they must be selected using external games / domain rules only.
     "role5_decoder": {
-        "enabled": False,  # enable after Role 4 and Role 3 contracts are approved
+        "enabled": False,
         "architecture": "spell_aware_temporal_state_machine",
         "output_classes": ("H", "A", "D", "X"),
         "abstain_label": "X",
@@ -494,7 +535,7 @@ CONFIG: dict[str, Any] = {
         "inputs": (
             "p_home",
             "p_away",
-            "p_dead",
+            "p_dead_ball",
             "role5_evidence_groups",
             "role5_quality_context_groups",
             "role5_general_context_groups",
@@ -531,7 +572,7 @@ CONFIG: dict[str, Any] = {
         "decision_label_column": "possession_label",
         "home_probability_column": "p_home",
         "away_probability_column": "p_away",
-        "dead_ball_probability_column": "p_dead",
+        "dead_ball_probability_column": "p_dead_ball",
         "match_id_column": "match_id",
         "frame_id_column": "frame_id",
         "output_format": "parquet",
@@ -556,131 +597,171 @@ CONFIG: dict[str, Any] = {
 
 
 def get_config() -> dict[str, Any]:
-    """Return an independent copy so experiments cannot mutate CONFIG globally."""
+    """Return an independent copy of the configuration."""
     return deepcopy(CONFIG)
 
 
+def frames_for_seconds(seconds: float, fps: float) -> int:
+    """Convert a time window to a sample count for the supplied FPS."""
+    if seconds < 0:
+        raise ValueError("seconds must be >= 0")
+    if fps <= 0:
+        raise ValueError("fps must be > 0")
+    return int(round(seconds * fps))
+
+
+def get_temporal_sampling_config(fps: float) -> dict[str, Any]:
+    """Return time-derived frame counts without mixing target and training FPS."""
+    temporal = CONFIG["physical_and_temporal"]
+    savgol_frames = frames_for_seconds(temporal["savgol_window_s"], fps)
+    if savgol_frames % 2 == 0:
+        savgol_frames += 1
+    savgol_frames = max(savgol_frames, int(temporal["savgol_poly"]) + 1)
+    if savgol_frames % 2 == 0:
+        savgol_frames += 1
+    return {
+        "fps": float(fps),
+        "dt_s": 1.0 / float(fps),
+        "short_gap_max_frames": frames_for_seconds(temporal["short_gap_max_s"], fps),
+        "window_short_frames": frames_for_seconds(temporal["window_short_s"], fps),
+        "window_long_frames": frames_for_seconds(temporal["window_long_s"], fps),
+        "reaction_time_frames": frames_for_seconds(temporal["reaction_time_s"], fps),
+        "savgol_window_frames": savgol_frames,
+    }
+
+
 def validate_project_config(config: dict[str, Any] | None = None) -> None:
-    """Validate fixed project-level contracts without guessing tuning values."""
+    """Validate stable architecture and data contracts."""
     cfg = CONFIG if config is None else config
-    project = cfg.get("project", {})
+    project = cfg["project"]
+    if project["schema_profile"] != "full_111":
+        raise ValueError("schema_profile must be 'full_111'.")
+    if project["expected_full_parquet_columns"] != 111:
+        raise ValueError("The full feature-engineering Parquet contract expects 111 columns.")
+    full_match = cfg["full_match_parquet"]
+    if full_match.get("expected_columns") != 111:
+        raise ValueError("full_match_parquet.expected_columns must be 111.")
+    if tuple(project["final_decision_classes"]) != ("H", "A", "D", "X"):
+        raise ValueError("Final decision classes must be exactly ('H', 'A', 'D', 'X').")
+    if project["target_classes"] != {"home": 0, "away": 1}:
+        raise ValueError("Role 4 target mapping must be Home=0, Away=1.")
 
-    if project.get("schema_profile") != "full_111":
-        raise ValueError("This project configuration expects schema_profile='full_111'.")
-    if project.get("expected_input_columns") != 111:
-        raise ValueError("The active Feature Engineering schema must contain 111 columns.")
-    if tuple(project.get("class_order_had", ())) != ("H", "A"):
-        raise ValueError("The H/A class order must be exactly ('H', 'A').")
-    if tuple(project.get("class_order_had_full", ())) != ("H", "A", "D"):
-        raise ValueError("The final class order must be exactly ('H', 'A', 'D').")
+    role4 = cfg["role4_training"]
+    if role4["expected_model_feature_count"] != 37:
+        raise ValueError("Role 4 must consume exactly 37 manifest-declared features.")
+    if role4["cross_validation"]["strategy"] != "GroupKFold":
+        raise ValueError("Role 4 validation must use GroupKFold by match_id.")
+    if role4["cross_validation"]["split_by_frames"]:
+        raise ValueError("Frame-wise random splitting is forbidden.")
+    if role4["cross_validation"]["group_column"] != role4["match_id_column"]:
+        raise ValueError("GroupKFold group column must equal the match_id column.")
 
-    feature_config = cfg.get("feature_engineering", {})
-    if not feature_config.get("include_broadcast") or not feature_config.get("include_lead_lag"):
-        raise ValueError(
-            "The active schema profile is full_111 and must include Broadcast and lead-lag features."
-        )
+    if cfg["feature_routing"]["drop_non_model_columns"]:
+        raise ValueError("Non-model columns must be preserved for Role 5.")
+    if cfg["competition_compliance"]["target_video_training_or_tuning_allowed"]:
+        raise ValueError("Training/tuning on the target video is prohibited.")
+    if cfg["competition_compliance"]["target_ground_truth_training_or_tuning_allowed"]:
+        raise ValueError("Training/tuning on target ground truth is prohibited.")
 
 
-def validate_quality_gating_config(config: dict[str, Any] | None = None) -> None:
-    """Fail early with a readable list of quality parameters still to choose.
-
-    This is intentionally separate from project-contract validation: the
-    project can be configured and imported before empirical quality scales
-    have been selected.
-    """
+def validate_probability_fusion_config(config: dict[str, Any] | None = None) -> None:
+    """Validate the semantic precondition for P(D)-weighted H/A fusion."""
     cfg = CONFIG if config is None else config
-    quality = cfg.get("quality_gating", {})
-    required_paths = (
-        ("ball", "status_quality", "OBSERVED"),
-        ("ball", "status_quality", "INTERPOLATED_SHORT"),
-        ("ball", "status_quality", "INFERRED_LATENT"),
-        ("ball", "fov_quality", 0),
-        ("ball", "fov_quality", 1),
-        ("ball", "sigma_scale_m"),
-        ("ball", "gap_scale_frames"),
-        ("homography", "reprojection_error_scale"),
-        ("history", "age_decay_frames"),
-        ("broadcast", "replay_recovery_frames"),
-    )
-    missing: list[str] = []
-    for path in required_paths:
-        value: Any = quality
-        for key in path:
-            if not isinstance(value, dict) or key not in value:
-                value = None
-                break
-            value = value[key]
-        if value is None:
-            missing.append("quality_gating." + ".".join(map(str, path)))
-
-    if missing:
+    role3_semantics = cfg["role3_output"].get("confirmed_semantics")
+    required = cfg["role3_output"].get("required_semantics_for_fusion")
+    fusion = cfg["probability_fusion"]
+    if fusion["enabled"] and role3_semantics != required:
         raise ValueError(
-            "Quality Gating parameters still require local selection: "
-            + ", ".join(missing)
+            "Probability fusion is enabled, but Role 3 has not confirmed that "
+            "P(D) means out-of-play probability only. Do not treat contested "
+            "in-play frames as dead ball."
         )
+    if fusion["enabled"] and fusion.get("require_role4_semantics_confirmation", True):
+        if not fusion.get("role4_conditional_semantics_confirmed", False):
+            raise ValueError(
+                "Probability fusion is enabled, but the Role 4 H/A probabilities "
+                "have not been validated as conditional live-play possession "
+                "probabilities. Binary H/A training alone does not prove this."
+            )
 
 
-# Validate invariant settings at import time. Data-dependent tuning parameters
-# are intentionally not validated until the Quality Gating stage is run.
-validate_project_config()
-
-
-# Keys that must exist (values may be None) so every stage can read its section.
-_REQUIRED_STRUCTURE: dict[str, tuple[str, ...]] = {
-    "labeling_functions": ("experts", "causality_policy", "quality_columns",
-                           "quality_cutoffs", "params", "emit_debug_columns"),
-    "label_model": ("backend", "class_order", "dependency_groups", "snorkel",
-                    "fit_on_time_blocks"),
-    "student_model": ("models_to_compare", "features", "temporal_validation",
-                      "ablation", "logistic", "gam"),
-    "fusion_export": ("class_order", "home_output_column", "away_output_column",
-                      "dead_ball_output_column", "frame_id_column",
-                      "probability_sum_tolerance", "output_format"),
-}
+def validate_role4_evidence_config(config: dict[str, Any] | None = None) -> None:
+    """Validate explicit Role 4 evidence rules without fitting any weights."""
+    cfg = CONFIG if config is None else config
+    block = cfg["role4_evidence_fusion"]
+    if block.get("method") != "bounded_log_odds_evidence":
+        raise ValueError("Role 4 evidence method must be bounded_log_odds_evidence.")
+    if float(block.get("max_total_adjustment_log_odds", -1)) < 0:
+        raise ValueError("Role 4 evidence global log-odds cap must be >= 0.")
+    if block.get("enabled", False) and not block.get("rules"):
+        raise ValueError("Role 4 evidence fusion is enabled but no evidence rules are configured.")
+    seen_names: set[str] = set()
+    allowed_kinds = {
+        "team_code",
+        "signed",
+        "signed_scaled",
+        "home_probability",
+        "paired_count_difference",
+    }
+    for rule in block.get("rules", []):
+        name = rule.get("name")
+        if not isinstance(name, str) or not name or name in seen_names:
+            raise ValueError("Every Role 4 evidence rule must have a unique non-empty name.")
+        seen_names.add(name)
+        kind = rule.get("kind")
+        if kind not in allowed_kinds:
+            raise ValueError(f"Unsupported evidence kind for {name!r}: {kind!r}.")
+        if kind == "paired_count_difference":
+            if not rule.get("home_column") or not rule.get("away_column"):
+                raise ValueError(f"Paired evidence rule {name!r} requires home_column and away_column.")
+        elif not isinstance(rule.get("column"), str) or not rule.get("column"):
+            raise ValueError(f"Evidence rule {name!r} must define a column.")
+        weight = float(rule.get("weight_log_odds", -1))
+        if weight < 0:
+            raise ValueError(f"Evidence weight for {name!r} must be >= 0.")
+        if kind in {"signed_scaled", "paired_count_difference"} and float(rule.get("scale", 0)) <= 0:
+            raise ValueError(f"Evidence scale for {name!r} must be > 0.")
+    if block.get("target_match_tuning_allowed", True):
+        raise ValueError("Role 4 evidence weights must never be tuned on the target match.")
 
 
 def validate_pipeline_structure(config: dict[str, Any] | None = None) -> None:
-    """Check that every downstream section/key exists (values may be None)."""
+    """Check that the current Role 3/4/5 sections exist."""
     cfg = CONFIG if config is None else config
-    problems: list[str] = []
-    for section, keys in _REQUIRED_STRUCTURE.items():
-        block = cfg.get(section)
-        if not isinstance(block, dict):
-            problems.append(f"missing section {section!r}")
-            continue
-        problems += [f"missing key {section}.{k}" for k in keys if k not in block]
-    if problems:
-        raise ValueError("CONFIG structure is incomplete: " + "; ".join(problems))
-    experts = tuple(cfg["labeling_functions"]["experts"])
-    for name in ("quality_columns", "params"):
-        extra = set(cfg["labeling_functions"][name]) - set(experts)
-        if extra:
-            raise ValueError(f"labeling_functions.{name} has unknown experts: {sorted(extra)}")
+    required_sections = (
+        "project",
+        "physical_and_temporal",
+        "full_match_parquet",
+        "role4_training",
+        "feature_routing",
+        "role4_evidence_fusion",
+        "role3_output",
+        "probability_fusion",
+        "role5_decoder",
+        "export_contract",
+        "competition_compliance",
+    )
+    missing = [key for key in required_sections if not isinstance(cfg.get(key), dict)]
+    if missing:
+        raise ValueError(f"Missing or invalid config sections: {missing}")
 
 
 def unresolved_parameters(config: dict[str, Any] | None = None) -> list[str]:
-    """List dotted paths of parameters still set to None (the TODO register).
-
-    Informational only: it never fails. `student_model.logistic.class_weight`
-    is skipped because None is a valid, meaningful value there.
-    """
+    """Return explicitly unset parameters; informational only."""
     cfg = CONFIG if config is None else config
-    skip = {"student_model.logistic.class_weight", "student_model.random_state"}
     found: list[str] = []
 
     def walk(node: Any, path: str) -> None:
         if isinstance(node, dict):
             for key, value in node.items():
                 walk(value, f"{path}.{key}" if path else str(key))
-        elif node is None:
+        elif value is None:
             found.append(path)
 
     walk(cfg, "")
     return found
 
 
-# Stable contracts are checked on import. Data-dependent/semantic selections are
-# checked only when the corresponding downstream stage is enabled.
 validate_project_config()
 validate_role4_evidence_config()
 validate_pipeline_structure()
