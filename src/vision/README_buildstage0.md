@@ -17,7 +17,7 @@ The scripts must be run in a strictly defined order, as they exchange generated 
 ### 2. `build_stage0_video.py`
 * **Purpose:** Building the base feature table for the classifier.
 * **How it works:** Loads the previously calculated `sync_offset.json`. Then, for each frame, it inverts the homography matrix ($H^{-1}$) and projects the center of the Full HD screen (960, 540) onto the pitch.
-* **Output file:** `data/interim/stage0_video.parquet` (contains `cam_lookat_x`, `cam_lookat_y`).
+* **Output file:** `data/interim/stage0_video.parquet` (contains `cam_lookat_x`, `cam_lookat_y`, `cam_fov_width`, `cam_speed`, among others).
 
 * **Geometry and constants:** All parameters used in the code are physical constants (1920x1080 resolution, 25 fps framerate, mathematical pitch boundaries [0..1]) or standard statistical thresholds (MAD threshold).
 
