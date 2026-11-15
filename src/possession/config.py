@@ -493,7 +493,7 @@ CONFIG: dict[str, Any] = {
     },
 
     "role3_output": {
-        "probability_column": "p_dead_ball",
+        "probability_column": "p_dead",
         "expected_range": (0.0, 1.0),
         "confirmed_semantics": None,
         "required_semantics_for_fusion": "out_of_play_only",
@@ -507,9 +507,9 @@ CONFIG: dict[str, Any] = {
             "Role3 must output P(ball_out_of_play). This is not guaranteed merely by binary H/A training."
         ),
         "formulas": {
-            "p_home": "(1 - p_dead_ball) * p_home_ha",
-            "p_away": "(1 - p_dead_ball) * p_away_ha",
-            "p_dead_ball": "p_dead_ball",
+            "p_home": "(1 - p_dead) * p_home_ha",
+            "p_away": "(1 - p_dead) * p_away_ha",
+            "p_dead": "p_dead",
         },
         "require_role3_semantics_confirmation": True,
         "role4_conditional_semantics_confirmed": False,
@@ -535,7 +535,7 @@ CONFIG: dict[str, Any] = {
         "inputs": (
             "p_home",
             "p_away",
-            "p_dead_ball",
+            "p_dead",
             "role5_evidence_groups",
             "role5_quality_context_groups",
             "role5_general_context_groups",
@@ -572,7 +572,7 @@ CONFIG: dict[str, Any] = {
         "decision_label_column": "possession_label",
         "home_probability_column": "p_home",
         "away_probability_column": "p_away",
-        "dead_ball_probability_column": "p_dead_ball",
+        "dead_ball_probability_column": "p_dead",
         "match_id_column": "match_id",
         "frame_id_column": "frame_id",
         "output_format": "parquet",
