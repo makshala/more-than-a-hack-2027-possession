@@ -1,0 +1,1149 @@
+"""Local diagnostics for selecting Quality Gating parameters.
+
+This module never labels possession and never treats quality scores as
+calibrated probabilities. It profiles the local match data, derives candidate
+scales from empirical quantiles, evaluates the resulting one-dimensional
+quality components, and writes reproducible CSV/Markdown/PNG reports.
+
+Typical usage from the project root:
+
+    from quality_diagnostics import run_quality_diagnostics_from_parquet
+
+    result = run_quality_diagnostics_from_parquet(
+        parquet_path="data/match_features.parquet",
+        output_dir="reports/quality_diagnostics",
+    )
+
+Or, when Feature Engineering has already produced a DataFrame:
+
+    result = run_quality_diagnostics(feature_df, "reports/quality_diagnostics")
+
+Required packages: pandas, numpy. Matplotlib is optional; plots are skipped when
+it is not installed. Parquet loading uses the engine already configured in the
+project environment (typically pyarrow).
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import warnings
+from datetime import datetime, timezone
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+import pandas as pd
+
+
+# Raw inputs that currently drive Quality Gating. The module is deliberately
+# tolerant of absent optional columns so it can inspect either the 98- or
+# 111-column Feature Engineering output and report schema gaps explicitly.
+QUALITY_INPUT_COLUMNS: tuple[str, ...] = (
+    "ball_status",
+    "ball_status_code",
+    "ball_sigma_m",
+    "ball_gap_frames",
+    "frames_since_ball_gap",
+    "frames_to_ball_gap",
+    "ball_in_camera_fov",
+    "ball_near_boundary",
+    "homography_reproj_err",
+    "camera_pan_speed",
+    "home_n_visible",
+    "away_n_visible",
+    "last_controlled_team",
+    "frames_since_last_control",
+    "home_pitch_control",
+    "home_mean_speed",
+    "away_mean_speed",
+    "home_length_x",
+    "away_length_x",
+    "home_width_y",
+    "away_width_y",
+    "all_players_mean_speed",
+    "players_walking_ratio",
+    "players_in_penalty_box",
+    "st_set_piece",
+    "st_throw_in",
+    "st_corner_kick",
+    "st_goal_kick",
+    "st_free_kick",
+    "st_kick_off",
+    "st_goal",
+    "st_post_goal_dead",
+    "st_defending_tag",
+    "st_in_box_tag",
+    "st_restart_team",
+    "st_team_prior",
+    "st_team_score",
+    "st_n_active_tags",
+    "brd_valid",
+    "brd_is_replay",
+    "frames_since_brd_replay",
+    "brd_lookat_x",
+    "brd_lookat_y",
+    "brd_lookat_speed_ms",
+    "brd_ball_x",
+    "brd_ball_y",
+    "ball_to_brd_lookat_dist_m",
+)
+
+# Positive-valued features used to derive candidate exponential scales.
+# For decay features: q(x) = exp(-x / scale).
+# For broadcast replay recovery: q(x) = 1 - exp(-x / scale).
+SCALE_FEATURES: dict[str, tuple[str, str]] = {
+    "sigma_scale_m": ("ball_sigma_m", "decay"),
+    "gap_scale_frames": ("ball_gap_frames", "decay"),
+    "reprojection_error_scale": ("homography_reproj_err", "decay"),
+    "age_decay_frames": ("frames_since_last_control", "decay"),
+    "replay_recovery_frames": ("frames_since_brd_replay", "recovery"),
+}
+
+CATEGORICAL_COLUMNS: tuple[str, ...] = (
+    "period",
+    "is_graded",
+    "ball_status",
+    "ball_status_code",
+    "ball_in_camera_fov",
+    "ball_near_boundary",
+    "last_controlled_team",
+    "st_restart_team",
+    "st_team_prior",
+    "brd_valid",
+    "brd_is_replay",
+)
+
+# A compact set of numeric inputs for a useful correlation audit. It contains
+# likely duplicate encodings and quality-source dependencies without creating
+# an unnecessarily large correlation matrix from every model predictor.
+CORRELATION_COLUMNS: tuple[str, ...] = (
+    "ball_speed",
+    "ball_vx",
+    "ball_vy",
+    "ball_status_code",
+    "ball_sigma_m",
+    "ball_gap_frames",
+    "frames_since_ball_gap",
+    "frames_to_ball_gap",
+    "ball_in_camera_fov",
+    "homography_reproj_err",
+    "camera_pan_speed",
+    "home_n_visible",
+    "away_n_visible",
+    "home_centroid_x",
+    "away_centroid_x",
+    "home_centroid_y",
+    "away_centroid_y",
+    "home_mean_speed",
+    "away_mean_speed",
+    "home_length_x",
+    "away_length_x",
+    "home_width_y",
+    "away_width_y",
+    "home_in_3m",
+    "away_in_3m",
+    "home_in_5m",
+    "away_in_5m",
+    "home_min_tti_s",
+    "away_min_tti_s",
+    "home_near1_dist_m",
+    "away_near1_dist_m",
+    "near1_dist_diff_m",
+    "tti_diff_s",
+    "home_pitch_control",
+    "last_controlled_team",
+    "frames_since_last_control",
+    "control_diff_roll50",
+    "control_diff_roll100",
+    "control_diff_causal50",
+    "control_diff_causal100",
+    "brd_valid",
+    "brd_is_replay",
+    "frames_since_brd_replay",
+    "brd_lookat_speed_ms",
+    "ball_to_brd_lookat_dist_m",
+)
+
+
+@dataclass(frozen=True)
+class DiagnosticsResult:
+    """Paths and in-memory tables generated by a diagnostic run."""
+
+    output_dir: Path
+    tables: Mapping[str, pd.DataFrame]
+    metadata: Mapping[str, Any]
+
+
+def _load_project_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if config is not None:
+        return config
+    try:
+        from config import CONFIG  # local project configuration
+
+        return CONFIG
+    except ImportError:
+        return {}
+
+
+def _diagnostic_settings(config: Mapping[str, Any]) -> dict[str, Any]:
+    quality_cfg = config.get("quality_gating", {}) if isinstance(config, Mapping) else {}
+    settings = quality_cfg.get("diagnostics", {}) if isinstance(quality_cfg, Mapping) else {}
+    defaults: dict[str, Any] = {
+        "filter_graded_only": True,
+        "periods": (1, 2),
+        "report_quantiles": (0.10, 0.25, 0.50, 0.75, 0.90, 0.99),
+        "candidate_scale_quantiles": (0.50, 0.75, 0.90),
+        "low_quality_threshold": 0.20,
+        "high_quality_threshold": 0.80,
+        "temporal_jump_threshold": 0.20,
+        "correlation_threshold": 0.90,
+        "fps": 25,
+        "max_plot_columns": 12,
+    }
+    if isinstance(settings, Mapping):
+        defaults.update(settings)
+    return defaults
+
+
+def _numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").astype("float64")
+
+
+def _filter_match_rows(
+    frame: pd.DataFrame,
+    *,
+    filter_graded_only: bool,
+    periods: Sequence[int],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    out = frame.copy()
+    original_rows = len(out)
+    applied: list[str] = []
+
+    if filter_graded_only and "is_graded" in out.columns:
+        graded = pd.to_numeric(out["is_graded"], errors="coerce").eq(1)
+        out = out.loc[graded].copy()
+        applied.append("is_graded == 1")
+
+    if periods and "period" in out.columns:
+        period_values = pd.to_numeric(out["period"], errors="coerce")
+        out = out.loc[period_values.isin(periods)].copy()
+        applied.append(f"period in {tuple(periods)}")
+
+    sort_columns = [column for column in ("period", "frame_id", "timestamp_s") if column in out.columns]
+    if sort_columns:
+        out = out.sort_values(sort_columns, kind="stable")
+
+    metadata = {
+        "rows_before_filter": int(original_rows),
+        "rows_after_filter": int(len(out)),
+        "rows_removed": int(original_rows - len(out)),
+        "filters_applied": applied,
+        "sort_columns": sort_columns,
+    }
+    if out.empty:
+        raise ValueError(
+            "No rows remain after match-time filtering. Check is_graded and period values, "
+            "or set filter_graded_only=False in the diagnostics configuration."
+        )
+    return out, metadata
+
+
+def _quantile_dict(series: pd.Series, quantiles: Sequence[float]) -> dict[str, float]:
+    valid = series[np.isfinite(series.to_numpy(dtype="float64", na_value=np.nan))]
+    if valid.empty:
+        return {f"p{int(round(q * 100)):02d}": np.nan for q in quantiles}
+    values = valid.quantile(list(quantiles), interpolation="linear")
+    return {f"p{int(round(q * 100)):02d}": float(values.loc[q]) for q in quantiles}
+
+
+def _profile_numeric(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+    quantiles: Sequence[float],
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for column in columns:
+        original = frame[column]
+        numeric = _numeric(original)
+        array = numeric.to_numpy(dtype="float64", na_value=np.nan)
+        non_null_original = int(original.notna().sum())
+        finite_mask = np.isfinite(array)
+        finite = numeric.loc[finite_mask]
+        non_numeric_count = int((original.notna() & numeric.isna()).sum())
+        row: dict[str, Any] = {
+            "column": column,
+            "dtype": str(original.dtype),
+            "n_rows": int(len(frame)),
+            "n_non_null_original": non_null_original,
+            "n_finite_numeric": int(finite_mask.sum()),
+            "missing_pct": float(original.isna().mean() * 100.0),
+            "non_numeric_pct_of_non_null": (
+                float(non_numeric_count / non_null_original * 100.0)
+                if non_null_original else np.nan
+            ),
+            "infinite_count": int(np.isinf(array).sum()),
+            "negative_pct_of_finite": (
+                float(finite.lt(0).mean() * 100.0) if not finite.empty else np.nan
+            ),
+            "zero_pct_of_finite": (
+                float(finite.eq(0).mean() * 100.0) if not finite.empty else np.nan
+            ),
+            "min": float(finite.min()) if not finite.empty else np.nan,
+            "max": float(finite.max()) if not finite.empty else np.nan,
+            "mean": float(finite.mean()) if not finite.empty else np.nan,
+            "std": float(finite.std()) if len(finite) > 1 else np.nan,
+        }
+        row.update(_quantile_dict(finite, quantiles))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _profile_all_numeric(
+    frame: pd.DataFrame,
+    quantiles: Sequence[float],
+) -> pd.DataFrame:
+    columns: list[str] = []
+    for column in frame.columns:
+        # Include native numeric columns and object columns that are almost
+        # entirely numeric. Text categories are reported separately.
+        converted = pd.to_numeric(frame[column], errors="coerce")
+        if pd.api.types.is_numeric_dtype(frame[column].dtype):
+            columns.append(column)
+        elif converted.notna().sum() > 0 and converted.notna().mean() >= 0.95:
+            columns.append(column)
+    return _profile_numeric(frame, columns, quantiles)
+
+
+def _profile_by_period(
+    frame: pd.DataFrame,
+    quantiles: Sequence[float],
+) -> pd.DataFrame:
+    if "period" not in frame.columns:
+        return pd.DataFrame()
+    pieces: list[pd.DataFrame] = []
+    for period_value, period_frame in frame.groupby("period", sort=True, dropna=False):
+        numeric_profile = _profile_all_numeric(period_frame, quantiles)
+        if not numeric_profile.empty:
+            numeric_profile.insert(0, "period", period_value)
+            pieces.append(numeric_profile)
+    return pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
+
+
+def _categorical_distributions(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for column in columns:
+        if column not in frame.columns:
+            continue
+        counts = frame[column].astype("string").fillna("<MISSING>").value_counts(dropna=False)
+        for value, count in counts.items():
+            rows.append(
+                {
+                    "column": column,
+                    "value": str(value),
+                    "count": int(count),
+                    "pct": float(count / len(frame) * 100.0) if len(frame) else np.nan,
+                }
+            )
+    return pd.DataFrame(rows, columns=["column", "value", "count", "pct"])
+
+
+def _candidate_scales(
+    frame: pd.DataFrame,
+    candidate_quantiles: Sequence[float],
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for parameter, (column, transform) in SCALE_FEATURES.items():
+        if column not in frame.columns:
+            continue
+        values = _numeric(frame[column])
+        eligible = pd.Series(True, index=frame.index)
+        # A historical age is meaningful only where a previous controlled team is known.
+        if parameter == "age_decay_frames" and "last_controlled_team" in frame.columns:
+            team = _numeric(frame["last_controlled_team"])
+            eligible &= team.isin((-1, 1))
+        # Replay recovery is meaningful after a replay and while the broadcast feed is valid.
+        if parameter == "replay_recovery_frames":
+            if "brd_valid" in frame.columns:
+                eligible &= _numeric(frame["brd_valid"]).eq(1)
+            if "brd_is_replay" in frame.columns:
+                eligible &= _numeric(frame["brd_is_replay"]).eq(0)
+        eligible_values = values.loc[eligible]
+        valid = eligible_values[np.isfinite(eligible_values) & eligible_values.ge(0)]
+        positive = valid[valid.gt(0)]
+        if positive.empty:
+            rows.append(
+                {
+                    "parameter": parameter,
+                    "source_column": column,
+                    "score_transform": transform,
+                    "candidate_quantile": np.nan,
+                    "candidate_scale": np.nan,
+                    "n_eligible_rows": int(eligible.sum()),
+                    "n_valid_nonnegative": int(len(valid)),
+                    "n_positive_for_scale": 0,
+                    "zero_pct_of_all_rows": float(values.eq(0).mean() * 100.0),
+                    "quality_at_candidate_scale": np.nan,
+                    "status": "no positive finite values; cannot derive scale",
+                }
+            )
+            continue
+        for quantile in candidate_quantiles:
+            if not 0.0 < float(quantile) < 1.0:
+                raise ValueError(f"Candidate quantile must be between 0 and 1, got {quantile!r}.")
+            scale = float(positive.quantile(float(quantile)))
+            rows.append(
+                {
+                    "parameter": parameter,
+                    "source_column": column,
+                    "score_transform": transform,
+                    "candidate_quantile": float(quantile),
+                    "candidate_scale": scale,
+                    "n_eligible_rows": int(eligible.sum()),
+                    "n_valid_nonnegative": int(len(valid)),
+                    "n_positive_for_scale": int(len(positive)),
+                    "zero_pct_of_all_rows": float(values.eq(0).mean() * 100.0),
+                    # q(s)=exp(-1) for decay; q(s)=1-exp(-1) for recovery.
+                    "quality_at_candidate_scale": (
+                        float(math.exp(-1.0))
+                        if transform == "decay"
+                        else float(1.0 - math.exp(-1.0))
+                    ),
+                    "status": "candidate only; requires domain review",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _run_lengths(mask: pd.Series) -> list[int]:
+    values = mask.fillna(False).to_numpy(dtype=bool)
+    if values.size == 0:
+        return []
+    boundaries = np.flatnonzero(np.diff(np.r_[False, values, False]))
+    return [int(end - start) for start, end in zip(boundaries[::2], boundaries[1::2])]
+
+
+def _temporal_metrics(
+    frame: pd.DataFrame,
+    quality: pd.Series,
+    *,
+    low_threshold: float,
+    jump_threshold: float,
+    fps: float,
+) -> dict[str, Any]:
+    work = pd.DataFrame({"quality": quality}, index=frame.index)
+    if "period" in frame.columns:
+        work["period"] = frame["period"]
+    else:
+        work["period"] = 0
+    if "frame_id" in frame.columns:
+        work["order"] = pd.to_numeric(frame["frame_id"], errors="coerce")
+    elif "timestamp_s" in frame.columns:
+        work["order"] = pd.to_numeric(frame["timestamp_s"], errors="coerce")
+    else:
+        work["order"] = np.arange(len(frame), dtype="int64")
+    work = work.sort_values(["period", "order"], kind="stable")
+
+    all_diffs: list[np.ndarray] = []
+    all_runs: list[int] = []
+    for _, period_group in work.groupby("period", dropna=False, sort=False):
+        period_group = period_group.copy()
+        order_delta = period_group["order"].diff()
+        if "frame_id" in frame.columns:
+            consecutive = order_delta.eq(1)
+        elif "timestamp_s" in frame.columns:
+            expected_delta = 1.0 / fps if fps > 0 else np.nan
+            consecutive = np.isclose(order_delta, expected_delta, atol=expected_delta * 0.25, rtol=0.0)
+        else:
+            consecutive = order_delta.eq(1)
+        # Do not treat rows separated by missing frames as adjacent time points.
+        segment_id = (~consecutive).cumsum()
+        period_group["segment_id"] = segment_id.to_numpy()
+        for _, segment in period_group.groupby("segment_id", sort=False):
+            q = segment["quality"].astype("float64")
+            diffs = q.diff().abs().dropna().to_numpy(dtype="float64")
+            if diffs.size:
+                all_diffs.append(diffs)
+            all_runs.extend(_run_lengths(q.lt(low_threshold)))
+
+    diff_values = np.concatenate(all_diffs) if all_diffs else np.asarray([], dtype="float64")
+    q_values = work["quality"].to_numpy(dtype="float64")
+    q_values = q_values[np.isfinite(q_values)]
+    return {
+        "n_rows": int(len(work)),
+        "low_quality_threshold": float(low_threshold),
+        "low_quality_pct": float((work["quality"] < low_threshold).mean() * 100.0),
+        "low_quality_run_count": int(len(all_runs)),
+        "low_quality_run_median_frames": float(np.median(all_runs)) if all_runs else 0.0,
+        "low_quality_run_p95_frames": float(np.quantile(all_runs, 0.95)) if all_runs else 0.0,
+        "low_quality_run_max_frames": int(max(all_runs)) if all_runs else 0,
+        "low_quality_run_median_seconds": (
+            float(np.median(all_runs) / fps) if all_runs and fps > 0 else np.nan
+        ),
+        "mean_abs_frame_delta": float(np.mean(diff_values)) if diff_values.size else np.nan,
+        "p95_abs_frame_delta": float(np.quantile(diff_values, 0.95)) if diff_values.size else np.nan,
+        "max_abs_frame_delta": float(np.max(diff_values)) if diff_values.size else np.nan,
+        "pct_frame_deltas_above_threshold": (
+            float((diff_values > jump_threshold).mean() * 100.0) if diff_values.size else np.nan
+        ),
+        "jump_threshold": float(jump_threshold),
+        "quality_mean": float(np.mean(q_values)) if q_values.size else np.nan,
+        "quality_median": float(np.median(q_values)) if q_values.size else np.nan,
+        "quality_p10": float(np.quantile(q_values, 0.10)) if q_values.size else np.nan,
+        "quality_p90": float(np.quantile(q_values, 0.90)) if q_values.size else np.nan,
+    }
+
+
+def _evaluate_candidate_scales(
+    frame: pd.DataFrame,
+    candidates: pd.DataFrame,
+    *,
+    low_threshold: float,
+    high_threshold: float,
+    jump_threshold: float,
+    fps: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    summaries: list[dict[str, Any]] = []
+    temporal_rows: list[dict[str, Any]] = []
+
+    for candidate in candidates.itertuples(index=False):
+        if not np.isfinite(candidate.candidate_scale) or candidate.candidate_scale <= 0:
+            continue
+        values = _numeric(frame[candidate.source_column])
+        eligible = pd.Series(True, index=frame.index)
+        if candidate.parameter == "age_decay_frames" and "last_controlled_team" in frame.columns:
+            eligible &= _numeric(frame["last_controlled_team"]).isin((-1, 1))
+        if candidate.parameter == "replay_recovery_frames":
+            if "brd_valid" in frame.columns:
+                eligible &= _numeric(frame["brd_valid"]).eq(1)
+            if "brd_is_replay" in frame.columns:
+                eligible &= _numeric(frame["brd_is_replay"]).eq(0)
+        valid = values.notna() & np.isfinite(values) & values.ge(0) & eligible
+        q = pd.Series(0.0, index=frame.index, dtype="float64")
+        if candidate.score_transform == "decay":
+            q.loc[valid] = np.exp(-values.loc[valid] / candidate.candidate_scale)
+        else:
+            q.loc[valid] = 1.0 - np.exp(-values.loc[valid] / candidate.candidate_scale)
+        q = q.clip(0.0, 1.0)
+
+        row = {
+            "parameter": candidate.parameter,
+            "source_column": candidate.source_column,
+            "score_transform": candidate.score_transform,
+            "candidate_quantile": candidate.candidate_quantile,
+            "candidate_scale": candidate.candidate_scale,
+            "n_rows_not_eligible_or_invalid_mapped_to_zero": int((~valid).sum()),
+            "quality_mean": float(q.mean()),
+            "quality_median": float(q.median()),
+            "quality_p10": float(q.quantile(0.10)),
+            "quality_p25": float(q.quantile(0.25)),
+            "quality_p75": float(q.quantile(0.75)),
+            "quality_p90": float(q.quantile(0.90)),
+            "pct_quality_below_low_threshold": float(q.lt(low_threshold).mean() * 100.0),
+            "pct_quality_above_high_threshold": float(q.gt(high_threshold).mean() * 100.0),
+        }
+        summaries.append(row)
+        temporal = _temporal_metrics(
+            frame,
+            q,
+            low_threshold=low_threshold,
+            jump_threshold=jump_threshold,
+            fps=fps,
+        )
+        temporal_rows.append({**row, **temporal})
+
+    return pd.DataFrame(summaries), pd.DataFrame(temporal_rows)
+
+
+def _monotonicity_checks(
+    frame: pd.DataFrame,
+    candidates: pd.DataFrame,
+) -> pd.DataFrame:
+    """Check whether each candidate transform moves in its intended direction."""
+    rows: list[dict[str, Any]] = []
+    for candidate in candidates.itertuples(index=False):
+        if not np.isfinite(candidate.candidate_scale) or candidate.candidate_scale <= 0:
+            continue
+        x = _numeric(frame[candidate.source_column])
+        valid = x.notna() & np.isfinite(x) & x.ge(0)
+        x = x.loc[valid]
+        if x.nunique(dropna=True) < 2:
+            rho = np.nan
+            direction_ok: bool | None = None
+            status = "insufficient variation"
+        else:
+            if candidate.score_transform == "decay":
+                q = np.exp(-x / candidate.candidate_scale)
+                expected = "negative"
+            else:
+                q = 1.0 - np.exp(-x / candidate.candidate_scale)
+                expected = "positive"
+            rho = float(x.corr(pd.Series(q, index=x.index), method="spearman"))
+            direction_ok = bool(rho <= 0.0) if expected == "negative" else bool(rho >= 0.0)
+            status = "pass" if direction_ok else "unexpected direction"
+        rows.append({
+            "parameter": candidate.parameter,
+            "source_column": candidate.source_column,
+            "candidate_quantile": candidate.candidate_quantile,
+            "candidate_scale": candidate.candidate_scale,
+            "expected_direction": "negative" if candidate.score_transform == "decay" else "positive",
+            "spearman_rho_input_vs_q": rho,
+            "direction_ok": direction_ok,
+            "status": status,
+            "note": "Formula is monotonic by construction; this checks the generated component against the local data and index alignment.",
+        })
+    return pd.DataFrame(rows)
+
+
+def _correlation_pairs(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+    threshold: float,
+) -> pd.DataFrame:
+    available = [column for column in columns if column in frame.columns]
+    numeric = pd.DataFrame({column: _numeric(frame[column]) for column in available})
+    numeric = numeric.loc[:, numeric.nunique(dropna=True) > 1]
+    if numeric.shape[1] < 2:
+        return pd.DataFrame(columns=["feature_a", "feature_b", "spearman_rho", "abs_rho", "n_pairwise"])
+
+    correlation = numeric.corr(method="spearman", min_periods=3)
+    rows: list[dict[str, Any]] = []
+    names = list(correlation.columns)
+    for i, feature_a in enumerate(names):
+        for feature_b in names[i + 1 :]:
+            rho = correlation.loc[feature_a, feature_b]
+            if pd.notna(rho) and abs(float(rho)) >= threshold:
+                pair = numeric[[feature_a, feature_b]].dropna()
+                rows.append(
+                    {
+                        "feature_a": feature_a,
+                        "feature_b": feature_b,
+                        "spearman_rho": float(rho),
+                        "abs_rho": float(abs(rho)),
+                        "n_pairwise": int(len(pair)),
+                    }
+                )
+    return pd.DataFrame(rows).sort_values("abs_rho", ascending=False).reset_index(drop=True) if rows else pd.DataFrame(
+        columns=["feature_a", "feature_b", "spearman_rho", "abs_rho", "n_pairwise"]
+    )
+
+
+def _domain_validation(frame: pd.DataFrame) -> pd.DataFrame:
+    """Count values outside simple, documented coding/range constraints.
+
+    These checks are diagnostics only. They do not modify or clip input data.
+    """
+    rows: list[dict[str, Any]] = []
+
+    def add_rule(column: str, rule: str, invalid: pd.Series, checked: pd.Series) -> None:
+        if column not in frame.columns:
+            return
+        n_checked = int(checked.sum())
+        n_invalid = int((invalid & checked).sum())
+        rows.append({
+            "column": column,
+            "expected_rule": rule,
+            "n_checked": n_checked,
+            "n_invalid": n_invalid,
+            "invalid_pct_of_checked": float(n_invalid / n_checked * 100.0) if n_checked else np.nan,
+        })
+
+    binary_columns = (
+        "is_graded", "is_pre_kickoff_d", "ball_in_camera_fov", "ball_near_boundary",
+        "brd_valid", "brd_is_replay", "st_set_piece", "st_throw_in", "st_corner_kick",
+        "st_goal_kick", "st_free_kick", "st_kick_off", "st_goal", "st_post_goal_dead",
+        "st_defending_tag", "st_in_box_tag", "is_contested",
+    )
+    for column in binary_columns:
+        if column in frame.columns:
+            values = _numeric(frame[column])
+            checked = values.notna() & np.isfinite(values)
+            add_rule(column, "must be 0 or 1", ~values.isin((0, 1)), checked)
+
+    team_columns = ("last_controlled_team", "st_restart_team", "st_team_prior", "gk_holding_ball_proxy")
+    for column in team_columns:
+        if column in frame.columns:
+            values = _numeric(frame[column])
+            checked = values.notna() & np.isfinite(values)
+            add_rule(column, "must be one of -1, 0, 1", ~values.isin((-1, 0, 1)), checked)
+
+    nonnegative_columns = (
+        "ball_sigma_m", "ball_gap_frames", "frames_since_ball_gap", "frames_to_ball_gap",
+        "homography_reproj_err", "home_n_visible", "away_n_visible", "home_min_tti_s",
+        "away_min_tti_s", "home_near1_dist_m", "away_near1_dist_m", "frames_since_last_control",
+        "frames_since_brd_replay", "brd_lookat_speed_ms", "ball_to_brd_lookat_dist_m",
+    )
+    for column in nonnegative_columns:
+        if column in frame.columns:
+            values = _numeric(frame[column])
+            checked = values.notna() & np.isfinite(values)
+            add_rule(column, "must be >= 0", values.lt(0), checked)
+
+    bounded_columns = {
+        "players_walking_ratio": (0.0, 1.0),
+        "home_pitch_control": (0.0, 1.0),
+    }
+    for column, (lower, upper) in bounded_columns.items():
+        if column in frame.columns:
+            values = _numeric(frame[column])
+            checked = values.notna() & np.isfinite(values)
+            add_rule(column, f"must be in [{lower}, {upper}]", ~values.between(lower, upper), checked)
+
+    if "period" in frame.columns:
+        values = _numeric(frame["period"])
+        checked = values.notna() & np.isfinite(values)
+        add_rule("period", "expected coding: 0, 1, or 2", ~values.isin((0, 1, 2)), checked)
+
+    if "ball_status" in frame.columns:
+        statuses = frame["ball_status"].astype("string").str.strip().str.upper()
+        checked = statuses.notna()
+        expected = {"OBSERVED", "INTERPOLATED_SHORT", "INFERRED_LATENT"}
+        add_rule("ball_status", f"expected one of {sorted(expected)}", ~statuses.isin(expected), checked)
+
+    if "home_n_visible" in frame.columns or "away_n_visible" in frame.columns:
+        for column in ("home_n_visible", "away_n_visible"):
+            if column in frame.columns:
+                values = _numeric(frame[column])
+                checked = values.notna() & np.isfinite(values)
+                add_rule(column, "expected integer count in [0, 11]", (~values.between(0, 11)) | (values % 1 != 0), checked)
+
+    return pd.DataFrame(rows, columns=[
+        "column", "expected_rule", "n_checked", "n_invalid", "invalid_pct_of_checked"
+    ])
+
+
+def _markdown_table(frame: pd.DataFrame, *, max_rows: int = 50) -> str:
+    """Render a small Markdown table without requiring the optional tabulate package."""
+    if frame.empty:
+        return "*(no rows)*"
+    view = frame.head(max_rows).copy()
+    headers = [str(column) for column in view.columns]
+    def cell(value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        if isinstance(value, (float, np.floating)):
+            return f"{float(value):.4g}"
+        return str(value).replace("|", "\\|").replace("\n", " ")
+    rows = [[cell(value) for value in row] for row in view.itertuples(index=False, name=None)]
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    lines.extend("| " + " | ".join(row) + " |" for row in rows)
+    if len(frame) > max_rows:
+        lines.append(f"\n_Showing {max_rows} of {len(frame)} rows._")
+    return "\n".join(lines)
+
+
+def _period_sensitivity(
+    frame: pd.DataFrame,
+    candidate_quantiles: Sequence[float],
+    *,
+    low_threshold: float,
+    high_threshold: float,
+    jump_threshold: float,
+    fps: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Repeat scale derivation/evaluation independently for each match period."""
+    if "period" not in frame.columns:
+        return pd.DataFrame(), pd.DataFrame()
+    candidate_parts: list[pd.DataFrame] = []
+    sensitivity_parts: list[pd.DataFrame] = []
+    for period_value, period_frame in frame.groupby("period", sort=True, dropna=False):
+        if period_frame.empty:
+            continue
+        period_candidates = _candidate_scales(period_frame, candidate_quantiles)
+        if not period_candidates.empty:
+            period_candidates.insert(0, "period", period_value)
+            candidate_parts.append(period_candidates)
+        period_sensitivity, _ = _evaluate_candidate_scales(
+            period_frame,
+            period_candidates.drop(columns=["period"], errors="ignore"),
+            low_threshold=low_threshold,
+            high_threshold=high_threshold,
+            jump_threshold=jump_threshold,
+            fps=fps,
+        )
+        if not period_sensitivity.empty:
+            period_sensitivity.insert(0, "period", period_value)
+            sensitivity_parts.append(period_sensitivity)
+    candidates = pd.concat(candidate_parts, ignore_index=True) if candidate_parts else pd.DataFrame()
+    sensitivity = pd.concat(sensitivity_parts, ignore_index=True) if sensitivity_parts else pd.DataFrame()
+    return candidates, sensitivity
+
+
+def _make_plots(
+    frame: pd.DataFrame,
+    candidates: pd.DataFrame,
+    sensitivity: pd.DataFrame,
+    output_dir: Path,
+    max_plot_columns: int,
+) -> list[str]:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        warnings.warn("matplotlib is not installed; CSV/Markdown reports were created without plots.")
+        return []
+
+    created: list[str] = []
+    plot_columns = [
+        column for column in QUALITY_INPUT_COLUMNS
+        if column in frame.columns and pd.api.types.is_numeric_dtype(frame[column].dtype)
+    ][:max_plot_columns]
+
+    for column in plot_columns:
+        values = _numeric(frame[column])
+        values = values[np.isfinite(values)]
+        if values.empty:
+            continue
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.hist(values.to_numpy(), bins=50)
+        ax.set_title(f"Distribution: {column}")
+        ax.set_xlabel(column)
+        ax.set_ylabel("Count")
+        fig.tight_layout()
+        filename = f"distribution_{column}.png"
+        fig.savefig(output_dir / filename, dpi=130)
+        plt.close(fig)
+        created.append(filename)
+
+    for parameter, subset in sensitivity.groupby("parameter", sort=False) if not sensitivity.empty else []:
+        subset = subset.sort_values("candidate_scale")
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.plot(subset["candidate_scale"], subset["quality_median"], marker="o", label="Median q")
+        ax.plot(subset["candidate_scale"], subset["pct_quality_below_low_threshold"] / 100.0,
+                marker="s", label="Fraction below low-q threshold")
+        ax.set_title(f"Scale sensitivity: {parameter}")
+        ax.set_xlabel("Candidate scale")
+        ax.set_ylabel("Score / fraction")
+        ax.legend()
+        fig.tight_layout()
+        filename = f"sensitivity_{parameter}.png"
+        fig.savefig(output_dir / filename, dpi=130)
+        plt.close(fig)
+        created.append(filename)
+
+    return created
+
+
+def _write_markdown_report(
+    output_dir: Path,
+    metadata: Mapping[str, Any],
+    profile: pd.DataFrame,
+    candidates: pd.DataFrame,
+    sensitivity: pd.DataFrame,
+    correlations: pd.DataFrame,
+    temporal: pd.DataFrame,
+    period_candidates: pd.DataFrame,
+    domain_validation: pd.DataFrame,
+    monotonicity: pd.DataFrame,
+    plots: Sequence[str],
+) -> None:
+    lines = [
+        "# Quality Gating — local diagnostic report",
+        "",
+        "> This report is descriptive. Candidate scales are not approved thresholds, and q values are heuristic quality indices, not calibrated probabilities.",
+        "",
+        "## Dataset scope",
+        "",
+        f"- Rows before filtering: **{metadata['rows_before_filter']:,}**",
+        f"- Rows after filtering: **{metadata['rows_after_filter']:,}**",
+        f"- Filters: {', '.join(metadata['filters_applied']) or 'none'}",
+        f"- Available columns: **{metadata['available_columns']}**",
+        f"- Missing expected quality-input columns: {', '.join(metadata['missing_quality_input_columns']) or 'none'}",
+        "",
+        "## Numeric input profile (selected first rows)",
+        "",
+        _markdown_table(profile.head(30)),
+        "",
+        "## Basic domain checks",
+        "",
+    ]
+    if domain_validation.empty:
+        lines.append("No domain checks could be applied to the available columns.")
+    else:
+        lines.append(_markdown_table(domain_validation))
+    lines.extend([
+        "",
+        "## Candidate scales",
+        "",
+        "The candidate scale is the selected positive-value quantile of its source feature. For a decay transform, q(scale) = exp(-1) ≈ 0.368. For replay recovery, q(scale) = 1 - exp(-1) ≈ 0.632.",
+        "`age_decay_frames` describes the freshness/relevance of the last-control history. It is not a measure of whether the historical observation itself was recorded correctly; keep that conceptual distinction when finalizing Quality Gating.",
+        "",
+    ])
+    if candidates.empty:
+        lines.append("No candidate scales could be derived from the available input columns.")
+    else:
+        lines.append(_markdown_table(candidates))
+    lines.extend(["", "## Sensitivity summary", ""])
+    if sensitivity.empty:
+        lines.append("No sensitivity scenarios were available.")
+    else:
+        cols = [
+            "parameter", "candidate_quantile", "candidate_scale", "quality_median",
+            "quality_p10", "quality_p90", "pct_quality_below_low_threshold",
+            "pct_quality_above_high_threshold",
+        ]
+        lines.append(_markdown_table(sensitivity[cols]))
+    lines.extend(["", "## Per-period candidate scales", ""])
+    if period_candidates.empty:
+        lines.append("Period-level candidates were not available (no period column or no positive values).")
+    else:
+        lines.append(_markdown_table(period_candidates))
+    lines.extend(["", "## Monotonicity checks", ""])
+    if monotonicity.empty:
+        lines.append("No monotonicity checks were available.")
+    else:
+        lines.append(_markdown_table(monotonicity))
+    lines.extend(["", "## High absolute Spearman correlations", ""])
+    if correlations.empty:
+        lines.append("No pairs met the configured absolute-correlation threshold.")
+    else:
+        lines.append(_markdown_table(correlations.head(40)))
+    lines.extend(["", "## Temporal behaviour of candidate quality components", ""])
+    if temporal.empty:
+        lines.append("No temporal sensitivity scenarios were available.")
+    else:
+        cols = [
+            "parameter", "candidate_quantile", "candidate_scale", "low_quality_pct",
+            "low_quality_run_median_frames", "low_quality_run_p95_frames",
+            "p95_abs_frame_delta", "pct_frame_deltas_above_threshold",
+        ]
+        lines.append(_markdown_table(temporal[cols]))
+    lines.extend(["", "## Plots", ""])
+    lines.extend([f"- `{name}`" for name in plots] or ["Plots were not generated (matplotlib unavailable or no plottable columns)."])
+    lines.extend(
+        [
+            "",
+            "## Interpretation checklist",
+            "",
+            "1. Check that negative values and non-finite values are either impossible by definition or explained.",
+            "2. Review each scale candidate in its physical unit (metres or frames), not only its resulting q distribution.",
+            "3. Compare the three candidate quantiles and look for excessively collapsed scores near 0 or 1.",
+            "4. Inspect long low-quality runs and large frame-to-frame changes; decide whether these match actual observation failures.",
+            "5. Do not select a scale because it creates a preferred possession distribution. Quality Gating must not decide H/A.",
+            "6. Review correlation pairs as potential redundancy/dependence, not as evidence that one feature is accurate.",
+            "",
+        ]
+    )
+    (output_dir / "quality_diagnostics_report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def run_quality_diagnostics(
+    frame: pd.DataFrame,
+    output_dir: str | Path,
+    *,
+    config: Mapping[str, Any] | None = None,
+) -> DiagnosticsResult:
+    """Run a local diagnostic audit on a Feature Engineering DataFrame.
+
+    The function is tolerant of either the 98-column or 111-column input
+    schema. Missing Broadcast columns are listed in the report, not fabricated.
+    It does not mutate ``frame`` or write anything outside ``output_dir``.
+    """
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("frame must be a pandas DataFrame.")
+    if frame.empty:
+        raise ValueError("frame is empty; cannot run Quality Gating diagnostics.")
+
+    project_config = _load_project_config(config)
+    settings = _diagnostic_settings(project_config)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    filtered, filter_metadata = _filter_match_rows(
+        frame,
+        filter_graded_only=bool(settings["filter_graded_only"]),
+        periods=tuple(settings["periods"]),
+    )
+
+    missing_quality_columns = [column for column in QUALITY_INPUT_COLUMNS if column not in filtered.columns]
+    available_quality_columns = [column for column in QUALITY_INPUT_COLUMNS if column in filtered.columns]
+    numeric_profile = _profile_all_numeric(filtered, tuple(settings["report_quantiles"]))
+    numeric_quality_columns = [
+        column for column in available_quality_columns
+        if pd.to_numeric(filtered[column], errors="coerce").notna().any()
+    ]
+    quality_profile = _profile_numeric(
+        filtered,
+        numeric_quality_columns,
+        tuple(settings["report_quantiles"]),
+    )
+    period_profile = _profile_by_period(filtered, tuple(settings["report_quantiles"]))
+    # Add all-numeric variables used by the quality module to the main profile
+    # without duplicating rows.
+    if quality_profile.empty:
+        quality_profile = numeric_profile.copy()
+    else:
+        non_quality_profile = numeric_profile.loc[~numeric_profile["column"].isin(quality_profile["column"])]
+        quality_profile = pd.concat([quality_profile, non_quality_profile], ignore_index=True)
+
+    categorical_columns = [column for column in CATEGORICAL_COLUMNS if column in filtered.columns]
+    categorical = _categorical_distributions(filtered, categorical_columns)
+
+    if {"ball_status", "ball_in_camera_fov"}.issubset(filtered.columns):
+        ball_status_fov = pd.crosstab(
+            filtered["ball_status"].astype("string").fillna("<MISSING>"),
+            filtered["ball_in_camera_fov"].astype("string").fillna("<MISSING>"),
+            normalize="index",
+            dropna=False,
+        ).reset_index()
+        ball_status_fov = ball_status_fov.rename(columns={"ball_status": "ball_status"})
+    else:
+        ball_status_fov = pd.DataFrame()
+
+    if {"ball_status", "ball_status_code"}.issubset(filtered.columns):
+        ball_status_code = pd.crosstab(
+            filtered["ball_status"].astype("string").fillna("<MISSING>"),
+            filtered["ball_status_code"].astype("string").fillna("<MISSING>"),
+            dropna=False,
+        ).reset_index()
+    else:
+        ball_status_code = pd.DataFrame()
+
+    candidates = _candidate_scales(
+        filtered,
+        tuple(settings["candidate_scale_quantiles"]),
+    )
+    if bool(settings.get("run_sensitivity_analysis", True)):
+        sensitivity, temporal = _evaluate_candidate_scales(
+            filtered,
+            candidates,
+            low_threshold=float(settings["low_quality_threshold"]),
+            high_threshold=float(settings["high_quality_threshold"]),
+            jump_threshold=float(settings["temporal_jump_threshold"]),
+            fps=float(settings["fps"]),
+        )
+    else:
+        sensitivity, temporal = pd.DataFrame(), pd.DataFrame()
+    monotonicity = (
+        _monotonicity_checks(filtered, candidates)
+        if bool(settings.get("check_monotonicity", True))
+        else pd.DataFrame()
+    )
+    if not bool(settings.get("check_temporal_stability", True)):
+        temporal = pd.DataFrame()
+    correlations = _correlation_pairs(
+        filtered,
+        CORRELATION_COLUMNS,
+        float(settings["correlation_threshold"]),
+    )
+    domain_validation = _domain_validation(filtered)
+    period_candidates, period_sensitivity = _period_sensitivity(
+        filtered,
+        tuple(settings["candidate_scale_quantiles"]),
+        low_threshold=float(settings["low_quality_threshold"]),
+        high_threshold=float(settings["high_quality_threshold"]),
+        jump_threshold=float(settings["temporal_jump_threshold"]),
+        fps=float(settings["fps"]),
+    )
+
+    plots = _make_plots(
+        filtered,
+        candidates,
+        sensitivity,
+        output_path,
+        int(settings["max_plot_columns"]),
+    )
+
+    metadata = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        **filter_metadata,
+        "available_columns": int(len(filtered.columns)),
+        "missing_quality_input_columns": missing_quality_columns,
+        "available_quality_input_columns": available_quality_columns,
+        "candidate_scale_features_present": [
+            column for _, (column, _) in SCALE_FEATURES.items() if column in filtered.columns
+        ],
+        "diagnostic_settings": {
+            key: (list(value) if isinstance(value, tuple) else value)
+            for key, value in settings.items()
+        },
+    }
+
+    tables: dict[str, pd.DataFrame] = {
+        "quality_input_profile": quality_profile,
+        "period_input_profile": period_profile,
+        "categorical_distributions": categorical,
+        "ball_status_x_fov": ball_status_fov,
+        "ball_status_x_code": ball_status_code,
+        "scale_candidates": candidates,
+        "sensitivity_summary": sensitivity,
+        "temporal_diagnostics": temporal,
+        "period_scale_candidates": period_candidates,
+        "period_sensitivity_summary": period_sensitivity,
+        "monotonicity_checks": monotonicity,
+        "correlation_pairs": correlations,
+        "domain_validation": domain_validation,
+    }
+
+    for name, table in tables.items():
+        table.to_csv(output_path / f"{name}.csv", index=False)
+
+    (output_path / "run_metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    _write_markdown_report(
+        output_path,
+        metadata,
+        quality_profile,
+        candidates,
+        sensitivity,
+        correlations,
+        temporal,
+        period_candidates,
+        domain_validation,
+        monotonicity,
+        plots,
+    )
+
+    return DiagnosticsResult(
+        output_dir=output_path,
+        tables=tables,
+        metadata=metadata,
+    )
+
+
+def run_quality_diagnostics_from_parquet(
+    parquet_path: str | Path,
+    output_dir: str | Path,
+    *,
+    config: Mapping[str, Any] | None = None,
+    columns: Sequence[str] | None = None,
+) -> DiagnosticsResult:
+    """Load a local Parquet file and run diagnostics without exporting its data.
+
+    ``columns`` can restrict the local read to known diagnostic inputs plus
+    frame/time context. By default all columns are read so numeric correlations
+    and schema coverage can be inspected.
+    """
+    path = Path(parquet_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Parquet file does not exist: {path}")
+    try:
+        frame = pd.read_parquet(path, columns=list(columns) if columns is not None else None)
+    except ImportError as exc:
+        raise ImportError(
+            "Reading Parquet requires a pandas Parquet engine such as pyarrow. "
+            "Install it in the local uv environment, for example: uv add pyarrow."
+        ) from exc
+    return run_quality_diagnostics(frame, output_dir, config=config)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run local Quality Gating diagnostics on a match-feature Parquet file."
+    )
+    parser.add_argument("parquet_path", help="Path to the local Parquet file")
+    parser.add_argument(
+        "--output-dir",
+        default="reports/quality_diagnostics",
+        help="Directory for local CSV/Markdown/PNG reports",
+    )
+    args = parser.parse_args()
+    result = run_quality_diagnostics_from_parquet(args.parquet_path, args.output_dir)
+    print(f"Quality diagnostics written to: {result.output_dir.resolve()}")
+    print(f"Rows analysed: {result.metadata['rows_after_filter']:,}")
+    if result.metadata["missing_quality_input_columns"]:
+        print("Missing quality inputs:", ", ".join(result.metadata["missing_quality_input_columns"]))
