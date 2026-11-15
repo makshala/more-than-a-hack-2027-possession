@@ -30,49 +30,12 @@ Raw machine learning models inspect video frames in isolation. While deep neural
 ---
 
 ## 3. Our Methodology & Approach
-
-To resolve these challenges, Role 5 implements a disciplined five-stage temporal decoding pipeline grounded in probability theory and the physical mechanics of football.
-
-```
-                    ┌──────────────────────────────────────────────┐
-                    │    Role 4 Upstream Frame Probabilities       │
-                    │   p_home(t), p_away(t), p_dead(t) [Parquet]  │
-                    └──────────────────────┬───────────────────────┘
-                                           │
-                                           ▼
-                    ┌──────────────────────────────────────────────┐
-                    │  1. Bayesian Inversion Layer                 │
-                    │     Converts raw posteriors to emissions;    │
-                    │     eliminates prior double-counting & lag   │
-                    └──────────────────────┬───────────────────────┘
-                                           │
-                                           ▼
-                    ┌──────────────────────────────────────────────┐
-                    │  2. Explicit-Duration Semi-Markov (HSMM)     │
-                    │     Applies continuous Gamma duration priors;│
-                    │     suppresses sub-second micro-possessions  │
-                    └──────────────────────┬───────────────────────┘
-                                           │
-                                           ▼
-                    ┌──────────────────────────────────────────────┐
-                    │  3. Context-Aware Dynamic Transitions        │
-                    │     Enforces football turnover rules;        │
-                    │     adapts to real-time prediction entropy   │
-                    └──────────────────────┬───────────────────────┘
-                                           │
-                                           ▼
-                    ┌──────────────────────────────────────────────┐
-                    │  4. 1D Morphology & Hysteresis Snapping      │
-                    │     Temporal closing/opening removes spikes; │
-                    │     snaps boundaries to stable tracking      │
-                    └──────────────────────┬───────────────────────┘
-                                           │
-                                           ▼
-                    ┌──────────────────────────────────────────────┐
-                    │  5. Continuous Tactical Possession Spells    │
-                    │     Exported to Parquet & CSV for Role 6     │
-                    └──────────────────────────────────────────────┘
-```
+To resolve the inherent challenges of high-frequency tactical estimation, Role 5 implements a disciplined temporal decoding pipeline. This architecture is firmly grounded in probability theory and the physical mechanics of football, processing raw upstream frame probabilities from Role 4 (ingested as Parquet files containing $p_{home}(t)$, $p_{away}(t)$, and $p_{dead}(t)$) to ultimately produce continuous tactical possession spells for Role 6. The system deliberately abandons naive, frame-by-frame argmax classifications in favor of a mathematically rigorous five-stage transformation designed to eradicate visual tracking noise while preserving authentic tactical turnovers.Bayesian Inversion Layer
+The raw probabilistic inputs provided by the upstream computer vision models represent the posterior probabilities $P(S_t \mid X_t)$, where $S_t$ is the tactical state and $X_t$ represents the observed features at frame $t$. Feeding these directly into a standard dynamic programming trellis inherently causes prior double-counting, leading to severe temporal lag at possession boundaries. To resolve this mathematical overlap, we apply a Bayesian inversion layer that algebraically strips the implicit baseline class frequencies $P(S_t)$ from the signal, isolating the true emission likelihoods $P(X_t \mid S_t)$. In the computationally stable log-domain, this transformation is executed as $\log P(X_t \mid S_t) \propto \log P(S_t \mid X_t) - \log P(S_t)$. This vital correction ensures that the downstream temporal model reacts instantaneously to genuine tactical turnovers rather than sluggishly fighting against static historical priors.Explicit-Duration Semi-Markov Modeling (HSMM)
+Traditional Hidden Markov Models impose a geometrically decaying probability on state durations, which directly contradicts the physical reality of football where possession spells possess distinct, non-zero minimal lifespans. To actively suppress physically impossible sub-second micro-possessions, the pipeline transitions to an Explicit-Duration Semi-Markov Model. Instead of evaluating isolated frame-by-frame transitions, this engine evaluates entire contiguous blocks of duration $d$. We enforce continuous duration priors utilizing a Gamma distribution, defined mathematically by the probability density function $f(d; k, \theta) = \frac{d^{k-1} e^{-\frac{d}{\theta}}}{\theta^k \Gamma(k)}$. By integrating this continuous distribution directly into the prefix-summed Viterbi trellis, the algorithm organically mathematically penalizes artificially short possession fragments while proportionally rewarding sustained tactical play.Context-Aware Dynamic Transitions
+Rather than relying on a rigid, static transition matrix, the pipeline enforces strict football turnover rules through dynamic transition penalties that seamlessly adapt to real-time prediction entropy. When the upstream frame-level predictions exhibit high uncertainty due to player occlusions or chaotic physical duels, the Shannon entropy of the prediction $H(t) = -\sum_{S} P(S_t \mid X_t) \log P(S_t \mid X_t)$ registers a significant spike. The dynamic transition layer continuously scales the transition matrix $A_{ij}^{(t)}$ based on this instantaneous $H(t)$ value. It relaxes state inertia during moments of high entropy, allowing the Gamma duration priors to heavily govern the sequence, and rigidly locks the current tactical state when the optical tracking pipeline exhibits absolute confidence.1D Morphology & Hysteresis Snapping
+Following the stochastic decoding phase, the resulting sequence undergoes a deterministic signal processing pass utilizing mathematical morphology in one dimension. A temporal closing operation, which consists of a morphological dilation followed immediately by an erosion, mathematically bridges microscopic gaps caused by momentary tracking failures. Subsequently, a temporal opening operation systematically removes isolated, high-confidence but physically disconnected state spikes. Finally, a hysteresis thresholding mechanism snaps the boundaries of these morphologically smoothed regions strictly to the nearest frames possessing highly stable tracking metadata, ensuring that the defined endpoints of any possession spell perfectly align with clear optical evidence.Continuous Tactical Possession Spells Export
+The culmination of this five-stage pipeline is a fully resolved, continuous time-series of tactical states. The temporally smoothed and snapped arrays are subjected to a high-performance Run-Length Encoding algorithm that compresses the discrete frame data into logical, actionable possession spells. Each exported spell is characterized by precise start frames, end frames, and absolute physical durations measured in both frames and seconds. This finalized tactical narrative is subsequently exported to both Parquet and CSV formats, serving as the definitive, noise-free foundation for the downstream analytical tasks executed by Role 6.
 
 ### Stage 1: Bayesian Inversion (Eliminating Boundary Lag)
 Upstream machine learning models output **posterior probabilities** $P(\text{State} \mid \text{Observation})$. These posteriors already internalize the frequency of states in the training dataset (the baseline prior). 
