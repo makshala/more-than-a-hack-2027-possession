@@ -9,15 +9,14 @@ import pandas as pd
 N_FRAMES: int = 199_319
 PITCH_LENGTH: float = 105.0
 PITCH_WIDTH: float = 68.0
-STAGE1_PITCH_LENGTH: float = 105.3  # Zgodnie z DATA.md oraz specyfikacją stage1_tracking.parquet
+STAGE1_PITCH_LENGTH: float = 105.3  # Per DATA.md and stage1_tracking.parquet specification
 HALF_LENGTH: float = PITCH_LENGTH / 2.0  # 52.5 m
 HALF_WIDTH: float = PITCH_WIDTH / 2.0    # 34.0 m
 
 
 def _align_raw_atd_to_video_frames(atd_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Zgodnie z DATA.md w surowym pliku ATD kolumna frame_id jest indeksowana 1..199319
-    (video_frame = frame_id - 1). Funkcja gwarantuje wyrównanie do 0..199318.
+    Aligns 1-indexed ATD tracking frame_id (1..199319) to 0-indexed video frames (0..199318).
     """
     df = atd_df.copy()
     if "frame_id" in df.columns:
@@ -38,8 +37,8 @@ def _extract_slot_arrays_from_raw_atd(
     away_slots: Optional[List[int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Wyodrębnia macierze (N, n_slots) dla pozycji X, Y przeskalowanych do [-52.5, 52.5] x [-34, 34]
-    oraz prędkości S (m/s) z 46-slotowego DataFrame'u ATD.
+    Extracts (N, n_slots) position matrices scaled to [-52.5, 52.5] x [-34, 34]
+    and speed matrices (m/s) from the 46-slot ATD DataFrame.
     """
     df = _align_raw_atd_to_video_frames(atd_df)
     cols = df.columns
@@ -128,7 +127,7 @@ def _compute_mean_interteam_distance_chunked(
     ay: np.ndarray,
     chunk_size: int = 16_384,
 ) -> np.ndarray:
-    """Oblicza średnią odległość H-A wektoryzowanie w blokach pamięci."""
+    """Computes mean H-A inter-team distance in memory-safe chunks."""
     n_frames = hx.shape[0]
     mean_dist = np.full(n_frames, np.nan, dtype=np.float32)
 
@@ -156,7 +155,7 @@ def _compute_mean_interteam_distance_chunked(
 
 
 def _masked_std_axis1(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Wektoryzowane odchylenie standardowe po osi 1 wolne od RuntimeWarning."""
+    """Vectorized standard deviation along axis 1 without RuntimeWarnings."""
     count = np.sum(mask, axis=1)
     safe_count = np.maximum(count, 1)
     vals = np.where(mask, arr, 0.0)
@@ -177,7 +176,7 @@ def _detect_static_structures_from_slots(
     ball_x: np.ndarray,
     ball_y: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Wykrywa uformowania struktur statycznych (mur przed wolnym / zgrupowanie w polu karnym)."""
+    """Detects static set-piece formations (free-kick defensive walls and corner box clusters)."""
     all_x = np.concatenate([hx, ax], axis=1)
     all_y = np.concatenate([hy, ay], axis=1)
     all_s = np.concatenate([hs, as_], axis=1)
@@ -213,13 +212,13 @@ def compute_kinematic_deadball_features(
     raw_atd_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
-    Oblicza komplet cech kinematycznych stanu D (5 cech bazowych + 3 cechy Top 1%:
-    - opponent_exclusion_score: reguła dystansu FIFA przy stałych fragmentach gry,
-    - control_void_score: brak zarejestrowanej kontroli piłki z maszyny stanów stage1,
-    - ball_death_flux: dokładny impuls rozpoczęcia stanu D - wyjście piłki za linię lub gwizdek).
+    Computes kinematic Dead-Ball features:
+    - opponent_exclusion_score: FIFA distance rule around stationary/slow balls,
+    - control_void_score: absence of registered ball control in Stage 1 state machine,
+    - ball_death_flux: onset impulse for State D (ball crossing boundary or referee whistle).
     """
     if stage1_df is None and raw_atd_df is None:
-        raise ValueError("Należy przekazać przynajmniej jeden z argumentów: stage1_df lub raw_atd_df.")
+        raise ValueError("At least one of stage1_df or raw_atd_df must be provided.")
 
     out = pd.DataFrame({"frame": np.arange(N_FRAMES, dtype=np.int32)})
 
@@ -273,7 +272,7 @@ def compute_kinematic_deadball_features(
         ) ** 2
         no_pressing_dist_m = np.sqrt(centroid_dist**2 + var_x + var_y).astype(np.float32)
 
-        # Fuzja pozycji piłki: wykorzystanie brd_ball_x / brd_ball_y gdy piłka taktyczna ma lukę
+        # Fuse broadcast ball position when tactical ball is latent
         bx_m = df["ball_x"].to_numpy(dtype=np.float32)
         by_m = df["ball_y"].to_numpy(dtype=np.float32)
         if {"brd_ball_x", "brd_ball_y", "brd_valid", "ball_status_code"}.issubset(df.columns):
@@ -288,16 +287,15 @@ def compute_kinematic_deadball_features(
             bx_m = np.where(tac_latent & brd_ok, brd_bx, bx_m)
             by_m = np.where(tac_latent & brd_ok, brd_by, by_m)
 
-        # Przeskalowanie z [0, 105.3] x [0, 68.0] do [-52.5, 52.5] x [-34.0, 34.0]
         ball_x_centered = (bx_m / STAGE1_PITCH_LENGTH - 0.5) * PITCH_LENGTH
         ball_y_centered = (by_m / PITCH_WIDTH - 0.5) * PITCH_WIDTH
 
-        oob_geom = (np.abs(ball_x_centered) >= HALF_LENGTH - 0.08) | (
-            np.abs(ball_y_centered) >= HALF_WIDTH - 0.08
+        oob_geom = (np.abs(ball_x_centered) >= HALF_LENGTH - 0.15) | (
+            np.abs(ball_y_centered) >= HALF_WIDTH - 0.15
         )
         near_bound = df["ball_near_boundary"].to_numpy(dtype=np.int8) > 0
         ball_out_of_bounds = oob_geom | (
-            near_bound & (df["ball_speed"].to_numpy(dtype=np.float32) < 1.6)
+            near_bound & (df["ball_speed"].to_numpy(dtype=np.float32) < 2.2)
         )
 
         if {"brd_valid", "brd_lookat_x", "brd_lookat_y", "brd_lookat_speed_ms"}.issubset(df.columns):
@@ -307,9 +305,9 @@ def compute_kinematic_deadball_features(
             b_lspd = df["brd_lookat_speed_ms"].to_numpy(dtype=np.float32)
             tv_at_boundary = (
                 b_val
-                & (b_lspd < 2.0)
+                & (b_lspd < 2.2)
                 & ((np.abs(b_lx) >= HALF_LENGTH - 3.5) | (np.abs(b_ly) >= HALF_WIDTH - 2.5))
-                & (walking_ratio_2ms >= 0.60)
+                & (walking_ratio_2ms >= 0.55)
             )
             ball_out_of_bounds = ball_out_of_bounds | (tv_at_boundary & near_bound)
 
@@ -324,7 +322,6 @@ def compute_kinematic_deadball_features(
         wall_dist_proxy = ((h_n2 >= 7.5) & (h_n2 <= 12.0)) | ((a_n2 >= 7.5) & (a_n2 <= 12.0))
         fk_wall = (ball_stat >= 15) & not_contested & wall_dist_proxy & (walking_ratio_2ms >= 0.65)
 
-    # Dodatkowe cechy Top 1% wyliczane na podstawie stage1_df (lub bezpieczne domyślne gdy brak)
     opponent_exclusion_score = np.zeros(N_FRAMES, dtype=np.float32)
     control_void_score = np.zeros(N_FRAMES, dtype=np.float32)
     ball_death_flux = np.zeros(N_FRAMES, dtype=np.float32)
@@ -342,29 +339,27 @@ def compute_kinematic_deadball_features(
         near_bound_f = df["ball_near_boundary"].to_numpy(dtype=np.int8) > 0
         is_cont = df["is_contested"].to_numpy(dtype=np.int8) > 0
 
-        # 1. Prawo strefy wykluczenia FIFA (Opponent Exclusion Zone wokół stojącej/wolnej piłki):
-        # Wykonawca jest blisko (< 2.5m), ale rywal szanuje dystans stałego fragmentu (> 4.0m..9.15m)
+        # 1. FIFA Opponent Exclusion Zone rule around stationary/slow ball
         min_d = np.minimum(h_n1, a_n1)
         max_d = np.maximum(h_n1, a_n1)
         one_team_in3 = ((h_in3 >= 1) & (a_in3 == 0)) | ((a_in3 >= 1) & (h_in3 == 0))
-        opp_respects_dist = np.clip((max_d - 3.5) / 5.5, 0.0, 1.0)
-        taker_ready = np.clip((3.0 - min_d) / 1.8, 0.0, 1.0)
-        ball_slow_or_stat = np.clip(ball_stat_f / 15.0, 0.0, 1.0) * (ball_spd < 2.0)
+        opp_respects_dist = np.clip((max_d - 3.2) / 5.2, 0.0, 1.0)
+        taker_ready = np.clip((3.2 - min_d) / 1.8, 0.0, 1.0)
+        ball_slow_or_stat = np.clip(ball_stat_f / 12.0, 0.0, 1.0) * (ball_spd < 2.2)
 
         opponent_exclusion_score = (
             opp_respects_dist * (0.6 * taker_ready + 0.4 * one_team_in3) * ball_slow_or_stat
         ).astype(np.float32)
 
-        # 2. Control Void Score z maszyny stanów posiadania Stage 1:
-        # Gdy od dawna nie było potwierdzonego kontaktu (frames_since_last_control rośnie), a gracze chodzą
+        # 2. Control Void Score from Stage 1 possession state machine
         if "frames_since_last_control" in df.columns:
             fslc = df["frames_since_last_control"].to_numpy(dtype=np.float32)
             control_void_score = (
-                np.clip((fslc - 25.0) / 75.0, 0.0, 1.0)
-                * np.clip((walking_ratio_2ms - 0.30) / 0.45, 0.0, 1.0)
+                np.clip((fslc - 18.0) / 60.0, 0.0, 1.0)
+                * np.clip((walking_ratio_2ms - 0.28) / 0.45, 0.0, 1.0)
             ).astype(np.float32)
 
-        # 3. Wykrycie specyficznych struktur: Kick-off (środek boiska + separacja połów) i Goal Kick (5.5m)
+        # 3. Specific static structures: Kick-off and Goal Kick
         if {"home_centroid_x_norm", "away_centroid_x_norm"}.issubset(df.columns):
             h_cxn = df["home_centroid_x_norm"].to_numpy(dtype=np.float32)
             a_cxn = df["away_centroid_x_norm"].to_numpy(dtype=np.float32)
@@ -382,29 +377,25 @@ def compute_kinematic_deadball_features(
             )
             goal_kick_setup_flag = gk_near & in_goal_area & (ball_stat_f >= 10) & (max_d > 8.0)
 
-        # 4. Ball Death Flux (Impuls początku stanu D - przekroczenie linii boiska lub gwizdek po faulu):
-        # Moment wejścia piłki w strefę przygraniczną/aut (narastające zbocze ball_near_boundary / ball_out_of_bounds)
+        # 4. Ball Death Flux (onset of State D - boundary crossing or referee whistle after foul)
         oob_int = (ball_out_of_bounds | near_bound_f).astype(np.int8)
         oob_onset = (oob_int == 1) & (np.roll(oob_int, 1) == 0)
         oob_onset[0] = False
-        # Rozmycie impulsu wyjścia na aut o ±4 klatki
-        oob_flux = np.convolve(oob_onset.astype(np.float32), np.hanning(9), mode="same")
+        oob_flux = np.convolve(oob_onset.astype(np.float32), np.hanning(11), mode="same")
 
-        # Moment gwizdka po faulu/zwarciu: wcześniej bezpośrednia walka (is_contested w ostatnich 35 klatkach),
-        # po której następuje wyhamowanie prędkości wszystkich graczy i stacjonarność piłki
         recent_contest = (
             np.convolve(is_cont.astype(np.float32), np.ones(35, dtype=np.float32) / 35.0, mode="same")
-            > 0.15
+            > 0.12
         )
         speed_drop = np.maximum(0.0, np.roll(mean_speed_all, 25) - mean_speed_all)
         speed_drop[:25] = 0.0
         whistle_flux = np.where(
             recent_contest,
-            np.clip(speed_drop / 1.5, 0.0, 1.0) * np.clip(walking_ratio_2ms, 0.0, 1.0),
+            np.clip(speed_drop / 1.4, 0.0, 1.0) * np.clip(walking_ratio_2ms, 0.0, 1.0),
             0.0,
         )
 
-        ball_death_flux = np.clip(0.75 * oob_flux + 0.55 * whistle_flux, 0.0, 1.5).astype(np.float32)
+        ball_death_flux = np.clip(0.80 * oob_flux + 0.60 * whistle_flux, 0.0, 1.5).astype(np.float32)
 
     static_structure_flag = (
         fk_wall | corner_cluster | kickoff_setup_flag | goal_kick_setup_flag
@@ -423,14 +414,14 @@ def compute_kinematic_deadball_features(
     out["control_void_score"] = control_void_score
     out["ball_death_flux"] = ball_death_flux
 
-    # Syntetyczny wynik kinematyczny stanu D
-    s_speed = np.clip((3.2 - mean_speed_all) / 2.0, 0.0, 1.0)
-    s_walk = np.clip((walking_ratio_2ms - 0.35) / 0.50, 0.0, 1.0)
+    # Composite kinematic Dead-Ball score
+    s_speed = np.clip((3.3 - mean_speed_all) / 2.0, 0.0, 1.0)
+    s_walk = np.clip((walking_ratio_2ms - 0.32) / 0.50, 0.0, 1.0)
     s_press = np.clip((no_pressing_dist_m - 14.0) / 14.0, 0.0, 1.0)
-    s_oob = ball_out_of_bounds.astype(np.float32) * 0.42
+    s_oob = ball_out_of_bounds.astype(np.float32) * 0.46
     s_struct = static_structure_flag.astype(np.float32) * 0.30
-    s_excl = opponent_exclusion_score * 0.30
-    s_void = control_void_score * 0.25
+    s_excl = opponent_exclusion_score * 0.32
+    s_void = control_void_score * 0.28
 
     raw_score = (
         0.25 * s_speed
@@ -444,7 +435,7 @@ def compute_kinematic_deadball_features(
 
     if stage1_df is not None:
         stat_norm = np.clip(
-            stage1_df["ball_stationary_frames"].to_numpy(dtype=np.float32) / 35.0, 0.0, 1.0
+            stage1_df["ball_stationary_frames"].to_numpy(dtype=np.float32) / 30.0, 0.0, 1.0
         )
         uncontested = 1.0 - stage1_df["is_contested"].to_numpy(dtype=np.float32)
 
@@ -459,7 +450,8 @@ def compute_kinematic_deadball_features(
 
         raw_score = 0.65 * raw_score + 0.25 * stat_norm + 0.10 * uncontested
 
-        # Silne stłumienie, gdy trwa aktywna seria podań/kontaktów jednej drużyny w żywej grze
+        # Suppress only during immediate active multi-touch chains (fslc <= 10 frames = 0.4s)
+        # so foul/out-of-bounds onset right after a touch is not suppressed.
         if {"home_consecutive_touches", "away_consecutive_touches", "frames_since_last_control"}.issubset(
             stage1_df.columns
         ):
@@ -468,15 +460,15 @@ def compute_kinematic_deadball_features(
                 stage1_df["away_consecutive_touches"].to_numpy(dtype=np.int16),
             )
             fslc = stage1_df["frames_since_last_control"].to_numpy(dtype=np.int32)
-            active_possession_chain = (max_touches >= 2) & (fslc <= 25) & (~ball_out_of_bounds)
-            raw_score = np.where(active_possession_chain, raw_score * 0.40, raw_score)
+            active_possession_chain = (max_touches >= 2) & (fslc <= 10) & (~ball_out_of_bounds)
+            raw_score = np.where(active_possession_chain, raw_score * 0.45, raw_score)
 
         if "brd_is_replay" in stage1_df.columns:
             brd_rep = stage1_df["brd_is_replay"].to_numpy(dtype=np.int8) == 1
             players_slow = mean_speed_all < 2.65
             raw_score = np.where(brd_rep & players_slow, np.maximum(raw_score, 0.88), raw_score)
 
-    kernel = np.ones(19, dtype=np.float32) / 19.0
+    kernel = np.ones(15, dtype=np.float32) / 15.0
     smooth_score = np.convolve(np.clip(raw_score, 0.0, 1.0), kernel, mode="same")
     out["kinematic_d_score"] = np.clip(smooth_score, 0.0, 1.0).astype(np.float32)
 

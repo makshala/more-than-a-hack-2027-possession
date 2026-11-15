@@ -25,14 +25,14 @@ def _compute_restart_impulse_signal(
     live_tag_onset_signal: np.ndarray,
 ) -> np.ndarray:
     """
-    Oblicza dla każdej klatki siłę impulsu wznowienia gry (phi_{D -> L}, "klatka 0").
-    Integruje 6 sygnałów fizycznych i taktycznych:
-    1. Skok przyspieszenia i prędkości piłki (taktycznej lub Broadcast) po fazie spoczynku.
-    2. Zryw prędkości zawodnika wykonującego stały fragment gry (taker burst).
-    3. Reset licznika frames_since_last_control (przejście z >30 klatek braku kontroli do 0).
-    4. Szarpnięcie kamery TV (brd_lookat_speed_ms) oraz kamery taktycznej (camera_pan_speed).
-    5. Krawędziowe cechy Lead/Lag (near1_diff_leadlag_10f, pitch_ctrl_leadlag_10f).
-    6. Impuls początku nowego tagu żywej fazy (BUILD UP, LONG BALL, PROGRESSION).
+    Computes the frame-level restart impulse strength (phi_{D -> L}, "frame 0").
+    Integrates 6 physical and tactical signals:
+    1. Ball acceleration and speed jump (tactical or broadcast fallback) after a stationary phase.
+    2. Speed burst of the set-piece taker near the ball.
+    3. Reset of frames_since_last_control (transition from >= 22 frames without control down to <= 1).
+    4. Broadcast camera whip (brd_lookat_speed_ms) and tactical camera pan acceleration.
+    5. Lead/Lag boundary features (near1_diff_leadlag_10f, pitch_ctrl_leadlag_10f).
+    6. Onset impulse of a live tactical phase tag (BUILD UP, LONG BALL, PROGRESSION).
     """
     ball_speed = stage1_df["ball_speed"].to_numpy(dtype=np.float32)
     ball_acc = stage1_df["ball_acc"].to_numpy(dtype=np.float32)
@@ -44,7 +44,7 @@ def _compute_restart_impulse_signal(
         status_code == 0, 1.0, np.where(status_code == 1, 0.70, 0.15)
     ).astype(np.float32)
 
-    # Fuzja z piłką z kamery Broadcast, gdy piłka taktyczna jest w luce (status_code > 0)
+    # Fuse broadcast ball coordinates when tactical ball tracking is in a gap (status_code > 0)
     if {"brd_ball_x", "brd_ball_y", "brd_valid"}.issubset(stage1_df.columns):
         brd_bx = stage1_df["brd_ball_x"].to_numpy(dtype=np.float32)
         brd_by = stage1_df["brd_ball_y"].to_numpy(dtype=np.float32)
@@ -65,7 +65,7 @@ def _compute_restart_impulse_signal(
 
     prev_stat = np.roll(ball_stat, 1)
     prev_stat[0] = 0.0
-    was_stationary = np.clip(prev_stat / 10.0, 0.25, 1.0)
+    was_stationary = np.clip(prev_stat / 8.0, 0.20, 1.0)
 
     speed_jump = np.maximum(0.0, ball_speed - np.roll(ball_speed, 2))
     speed_jump[:2] = 0.0
@@ -76,7 +76,7 @@ def _compute_restart_impulse_signal(
         + 0.20 * np.clip(deflection / 1.5, 0.0, 1.0)
     ) * was_stationary * ball_reliability
 
-    # Zryw prędkości zawodnika wykonującego wznowienie
+    # Set-piece taker speed burst near the ball
     h_dist = stage1_df["home_near1_dist_m"].to_numpy(dtype=np.float32)
     a_dist = stage1_df["away_near1_dist_m"].to_numpy(dtype=np.float32)
     h_spd = stage1_df["home_near1_speed_ms"].to_numpy(dtype=np.float32)
@@ -100,20 +100,21 @@ def _compute_restart_impulse_signal(
 
     total_impulse = ball_kick_impulse + (1.0 - 0.55 * ball_reliability) * player_burst_impulse
 
-    # Reset licznika frames_since_last_control (bezpośrednia detekcja kontaktu po przerwie)
+    # Direct ball-contact reset after a stoppage gap
     if "frames_since_last_control" in stage1_df.columns:
         fslc = stage1_df["frames_since_last_control"].to_numpy(dtype=np.int32)
         prev_fslc = np.roll(fslc, 1)
         prev_fslc[0] = 0
-        contact_reset = (fslc <= 1) & (prev_fslc >= 30)
+        contact_reset = (fslc <= 1) & (prev_fslc >= 22)
         reset_strength = np.where(
-            contact_reset, np.clip(prev_fslc.astype(np.float32) / 100.0, 0.4, 1.2), 0.0
+            contact_reset, np.clip(prev_fslc.astype(np.float32) / 90.0, 0.4, 1.2), 0.0
         )
-        # Lekkie wygładzenie o ±2 klatki
-        reset_smooth = np.convolve(reset_strength, np.array([0.25, 0.6, 1.0, 0.6, 0.25], dtype=np.float32), mode="same")
+        reset_smooth = np.convolve(
+            reset_strength, np.array([0.25, 0.6, 1.0, 0.6, 0.25], dtype=np.float32), mode="same"
+        )
         total_impulse += 0.55 * reset_smooth
 
-    # Szarpnięcie kamery TV (brd_lookat_speed_ms) przy dalekich wykopach/wznowieniach
+    # Broadcast camera whip on long restarts
     if {"brd_lookat_speed_ms", "brd_valid"}.issubset(stage1_df.columns):
         brd_lspd = stage1_df["brd_lookat_speed_ms"].to_numpy(dtype=np.float32)
         brd_val = stage1_df["brd_valid"].to_numpy(dtype=np.int8) == 1
@@ -130,14 +131,14 @@ def _compute_restart_impulse_signal(
         )
         total_impulse += cam_whip_signal
 
-    # Przyspieszenie panoramowania kamery taktycznej (camera_pan_speed)
+    # Tactical camera pan acceleration
     if "camera_pan_speed" in stage1_df.columns:
         tac_pan = stage1_df["camera_pan_speed"].to_numpy(dtype=np.float32)
         tac_pan_jump = np.maximum(0.0, tac_pan - np.roll(tac_pan, 4))
         tac_pan_jump[:4] = 0.0
         total_impulse += 0.12 * np.clip(tac_pan_jump / 180.0, 0.0, 1.0)
 
-    # Krawędziowe cechy Lead/Lag (10f)
+    # Lead/Lag edge features (10 frames)
     if {"near1_diff_leadlag_10f", "pitch_ctrl_leadlag_10f"}.issubset(stage1_df.columns):
         n1_ll10 = np.abs(stage1_df["near1_diff_leadlag_10f"].to_numpy(dtype=np.float32))
         pc_ll10 = np.abs(stage1_df["pitch_ctrl_leadlag_10f"].to_numpy(dtype=np.float32))
@@ -146,7 +147,7 @@ def _compute_restart_impulse_signal(
         )
         total_impulse += edge_signal
 
-    # Impuls startu tagu żywej fazy (np. BUILD UP / LONG BALL)
+    # Live phase tag onset impulse
     total_impulse += 0.25 * live_tag_onset_signal
 
     return total_impulse.astype(np.float32)
@@ -158,32 +159,28 @@ def _compute_type_geometry_compatibility(
     by_slice: np.ndarray,
 ) -> np.ndarray:
     """
-    Zwraca mnożnik kompatybilności geometrycznej [0.5 .. 1.35] dla kandydata na 'klatkę 0'
-    w zależności od typu stałego fragmentu gry (throw_in, corner_kick, goal_kick, kick_off).
+    Returns a spatial compatibility multiplier [0.5 .. 1.35] for a candidate restart frame
+    based on the set-piece type (throw_in, corner_kick, goal_kick, kick_off).
     """
     n = len(bx_slice)
     if sp_type_val is None or n == 0:
         return np.ones(n, dtype=np.float32)
 
     if sp_type_val == "throw_in":
-        # Wrzut z autu odbywa się przy linii bocznej: |y| bliskie 34.0m
         near_sideline = np.abs(by_slice) >= (HALF_WIDTH - 4.5)
         return np.where(near_sideline, 1.30, 0.65).astype(np.float32)
 
     if sp_type_val == "corner_kick":
-        # Rzut rożny odbywa się w narożniku boiska: |x| bliskie 52.5m oraz |y| bliskie 34.0m
         near_corner = (np.abs(bx_slice) >= (HALF_LENGTH - 6.5)) & (
             np.abs(by_slice) >= (HALF_WIDTH - 6.5)
         )
         return np.where(near_corner, 1.35, 0.60).astype(np.float32)
 
     if sp_type_val == "goal_kick":
-        # Wznowienie od bramki odbywa się z pola bramkowego: |x| >= 43.0m, |y| <= 12.0m
         in_goal_box = (np.abs(bx_slice) >= (HALF_LENGTH - 9.5)) & (np.abs(by_slice) <= 12.5)
         return np.where(in_goal_box, 1.35, 0.65).astype(np.float32)
 
     if sp_type_val in ("kick_off", "post_goal"):
-        # Rozpoczęcie ze środka boiska: (x, y) w pobliżu (0, 0)
         near_center = (np.abs(bx_slice) <= 5.0) & (np.abs(by_slice) <= 5.0)
         return np.where(near_center, 1.35, 0.60).astype(np.float32)
 
@@ -201,11 +198,10 @@ def _snap_both_deadball_edges(
     ball_y_centered: np.ndarray,
 ) -> np.ndarray:
     """
-    Przyciąga OBIE krawędzie każdego okna stanu D:
-    1. Lewą krawędź (d_start): do dokładnego momentu wyjścia piłki na aut/róg lub gwizdka sędziego
-       (szczyt death_flux przed fazą niskiej dynamiki), eliminując 1-2s opóźnienia kinematyki graczy.
-    2. Prawą krawędź (frame_zero): do dokładnego momentu pierwszego dotknięcia piłki wznawiającego grę
-       (szczyt restart_flux z walidacją geometryczną sp_type).
+    Snaps both boundaries of each Dead-Ball window without prematurely truncating D segments:
+    1. Left boundary (d_start): aligns to the exact ball-out-of-bounds or referee whistle impulse.
+    2. Right boundary (frame_zero): aligns to the true restart kick/throw in the second half of the window,
+       avoiding false early triggers from players retrieving the ball.
     """
     p_refined = p_dead_raw.copy()
 
@@ -218,13 +214,14 @@ def _snap_both_deadball_edges(
         if win_len < 12:
             continue
 
-        # Dominujący typ stałego fragmentu w danym oknie
         win_types = sp_type_arr[s_idx : e_idx + 1]
         valid_types = [t for t in win_types if t is not None]
         dom_type = valid_types[0] if len(valid_types) > 0 else None
 
-        # --- KROK A: Detekcja prawej krawędzi ("klatki 0" - wznowienie gry) ---
-        search_start = s_idx + int(0.22 * win_len)
+        # --- STEP A: Detect right boundary ("frame 0" - actual ball restart) ---
+        # Search starts at 45% of the padded window (after the pre-padding and setup phase)
+        # so ball retrieval movements are never mistaken for the restart kick.
+        search_start = s_idx + int(0.45 * win_len)
         search_slice = slice(search_start, e_idx + 1)
 
         local_imp = restart_flux[search_slice]
@@ -240,52 +237,53 @@ def _snap_both_deadball_edges(
 
         restart_score = (local_imp * (0.5 + 0.5 * pre_kin) + 0.45 * kin_drop) * geom_mult
 
-        if restart_score.size > 0 and np.max(restart_score) > 0.22:
+        if restart_score.size > 0 and np.max(restart_score) > 0.34:
             best_offset = int(np.argmax(restart_score))
             frame_zero = search_start + best_offset
         else:
-            frame_zero = max(s_idx + 10, e_idx - 35)
+            # Default fallback near the end of the core tag (e_idx - 50 frames)
+            frame_zero = max(search_start, e_idx - 50)
 
-        # --- KROK B: Detekcja lewej krawędzi (d_start - moment wyjścia piłki / gwizdka) ---
-        left_search_end = max(s_idx + 1, frame_zero - 10)
+        # --- STEP B: Detect left boundary (d_start - ball out-of-bounds or whistle) ---
+        left_search_end = max(s_idx + 1, frame_zero - 12)
         left_slice = slice(s_idx, left_search_end)
         local_death = death_flux[left_slice]
         local_kin = kinematic_d_score[left_slice]
-        future_kin = np.roll(kinematic_d_score, -30)[left_slice]
+        future_kin = np.roll(kinematic_d_score, -25)[left_slice]
 
-        # Szukamy pierwszej wyraźnej oznaki śmierci piłki (przekroczenie linii boiska lub skok kinematyki D)
         death_candidates = np.flatnonzero(
-            ((local_death > 0.28) & (future_kin > 0.38)) | (local_kin > 0.44)
+            ((local_death > 0.22) & (future_kin > 0.30))
+            | (local_kin > 0.34)
+            | (p_dead_raw[left_slice] > 0.46)
         )
         if death_candidates.size > 0:
             d_start = s_idx + int(death_candidates[0])
-            # Doprecyzowanie do lokalnego maksimum death_flux w oknie ±12 klatek wokół d_start
             refine_s = max(s_idx, d_start - 12)
             refine_e = min(frame_zero - 5, d_start + 12)
-            if refine_e > refine_s and np.max(death_flux[refine_s:refine_e]) > 0.30:
+            if refine_e > refine_s and np.max(death_flux[refine_s:refine_e]) > 0.25:
                 d_start = refine_s + int(np.argmax(death_flux[refine_s:refine_e]))
         else:
             d_start = s_idx
 
-        # Wygaszenie fałszywego stanu D PRZED d_start (gdy piłka była jeszcze w grze przed wyjściem na aut)
+        # Gently suppress only confirmed pre-whistle live frames before d_start
         if d_start > s_idx:
             p_refined[s_idx:d_start] = np.minimum(
                 p_refined[s_idx:d_start],
-                0.28 * kinematic_d_score[s_idx:d_start],
+                0.42 * kinematic_d_score[s_idx:d_start],
             )
 
-        # Wzmocnienie p_dead wewnątrz [d_start, frame_zero)
+        # Boost p_dead inside the active stoppage interval [d_start, frame_zero)
         if frame_zero > d_start:
             p_refined[d_start:frame_zero] = np.maximum(
                 p_refined[d_start:frame_zero],
-                np.clip(0.60 + 0.38 * kinematic_d_score[d_start:frame_zero], 0.68, 0.99),
+                np.clip(0.64 + 0.34 * kinematic_d_score[d_start:frame_zero], 0.68, 0.99),
             )
 
-        # Gwałtowne wygaszenie p_dead od klatki 0 (moment pierwszego kontaktu wznawiającego grę)
-        post_end = min(N_FRAMES, max(e_idx + 1, frame_zero + 55))
+        # Crisp post-restart decay over a short 22-frame (0.88s) window after frame_zero
+        post_end = min(N_FRAMES, frame_zero + 22)
         decay_len = post_end - frame_zero
         if decay_len > 0:
-            decay_curve = np.linspace(0.03, 0.20, decay_len, dtype=np.float32)
+            decay_curve = np.linspace(0.08, 0.32, decay_len, dtype=np.float32)
             p_refined[frame_zero:post_end] = np.minimum(
                 p_refined[frame_zero:post_end],
                 decay_curve * kinematic_d_score[frame_zero:post_end],
@@ -299,31 +297,27 @@ def _viterbi_and_posterior_decode(
     death_flux: np.ndarray,
     restart_flux: np.ndarray,
     period_arr: np.ndarray,
-    base_switch_penalty: float = 14.0,
-    min_live_gap_frames: int = 45,
-    min_dead_duration_frames: int = 65,
+    base_switch_penalty: float = 8.5,
+    min_live_gap_frames: int = 22,
+    min_dead_duration_frames: int = 25,
 ) -> np.ndarray:
     """
-    Globalny dekoder 2-stanowy Viterbiego połączony z kalibracją prawdopodobieństwa a posteriori.
-    W przestrzeni Log-Odds szuka globalnie optymalnego podziału na LIVE (0) i DEAD (1),
-    gdzie kara za zmianę stanu (base_switch_penalty) jest dynamicznie obniżana w klatkach
-    z wysokim death_flux (przejście LIVE -> DEAD) oraz restart_flux (przejście DEAD -> LIVE).
-    Gwarantuje, że próg p_dead >= 0.50 odpowiada dokładnie 1:1 optymalnej ścieżce Viterbiego.
+    Global 2-state Log-Odds Viterbi decoder coupled with posterior probability calibration.
+    Uses responsive transition penalties (base_switch_penalty=8.5, min_dead_duration_frames=25 = 1.0s)
+    so genuine quick throw-ins and free kicks are preserved to separate consecutive possessions.
     """
     p_clamped = np.clip(p_dead_snapped, 1e-4, 1.0 - 1e-4).astype(np.float32)
     log_odds_d = np.log(p_clamped / (1.0 - p_clamped)).astype(np.float32)
 
-    # Koszt przejścia LIVE -> DEAD i DEAD -> LIVE w każdej klatce
-    cost_l2d = np.maximum(1.5, base_switch_penalty - 8.5 * np.clip(death_flux, 0.0, 1.4)).astype(
+    cost_l2d = np.maximum(1.2, base_switch_penalty - 6.0 * np.clip(death_flux, 0.0, 1.4)).astype(
         np.float32
     )
-    cost_d2l = np.maximum(1.5, base_switch_penalty - 9.5 * np.clip(restart_flux, 0.0, 1.4)).astype(
+    cost_d2l = np.maximum(1.2, base_switch_penalty - 6.5 * np.clip(restart_flux, 0.0, 1.4)).astype(
         np.float32
     )
 
     viterbi_state = np.zeros(N_FRAMES, dtype=bool)
 
-    # Uruchamiamy dekoder Viterbiego osobno dla każdej połowy (oraz dla okresów poza grą)
     for p_val in (1, 2):
         idx = np.flatnonzero(period_arr == p_val)
         if idx.size == 0:
@@ -331,7 +325,6 @@ def _viterbi_and_posterior_decode(
         s_f, e_f = int(idx[0]), int(idx[-1])
         length = e_f - s_f + 1
 
-        # Konwersja do list Pythonowych zapewnia wykonanie pętli DP w ~15 milisekund bez narzutu NumPy
         emit_list = log_odds_d[s_f : e_f + 1].tolist()
         c_l2d_list = cost_l2d[s_f : e_f + 1].tolist()
         c_d2l_list = cost_d2l[s_f : e_f + 1].tolist()
@@ -339,13 +332,12 @@ def _viterbi_and_posterior_decode(
         back_0 = [0] * length
         back_1 = [0] * length
 
-        # Inicjalizacja w klatce 0 połowy
         v0 = -0.5 * emit_list[0]
         v1 = 0.5 * emit_list[0]
 
         for t in range(1, length):
             em = 0.5 * emit_list[t]
-            # Nowy stan 0 (LIVE)
+            # State 0 (LIVE)
             stay_0 = v0 - em
             from_1 = v1 - c_d2l_list[t] - em
             if stay_0 >= from_1:
@@ -355,7 +347,7 @@ def _viterbi_and_posterior_decode(
                 nv0 = from_1
                 back_0[t] = 1
 
-            # Nowy stan 1 (DEAD)
+            # State 1 (DEAD)
             stay_1 = v1 + em
             from_0 = v0 - c_l2d_list[t] + em
             if stay_1 >= from_0:
@@ -367,7 +359,6 @@ def _viterbi_and_posterior_decode(
 
             v0, v1 = nv0, nv1
 
-        # Backtracking optymalnej ścieżki
         path = [0] * length
         curr = 1 if v1 > v0 else 0
         path[length - 1] = curr
@@ -377,7 +368,7 @@ def _viterbi_and_posterior_decode(
 
         viterbi_state[s_f : e_f + 1] = np.array(path, dtype=bool)
 
-    # Filtr morfologiczny chroniący przed mikro-posiadaniami i fałszywymi przecięciami (spellF1)
+    # Morphological cleanup preserving all stoppages >= 1.0s (25 frames)
     padded_inv = np.concatenate([[False], ~viterbi_state, [False]])
     g_starts = np.flatnonzero(padded_inv[1:] & ~padded_inv[:-1])
     g_ends = np.flatnonzero(~padded_inv[1:] & padded_inv[:-1]) - 1
@@ -392,13 +383,13 @@ def _viterbi_and_posterior_decode(
         if (de - ds + 1) < min_dead_duration_frames:
             viterbi_state[ds : de + 1] = False
 
-    # Kalibracja gładkiego prawdopodobieństwa p_dead tak, by było w 100% spójne ze ścieżką Viterbiego:
-    # Wewnątrz segmentów Viterbi-DEAD: przedział [0.55, 0.99]
-    # Wewnątrz segmentów Viterbi-LIVE: przedział [0.01, 0.44]
+    # Posterior probability calibration aligned with Viterbi path:
+    # Inside Viterbi-DEAD: [0.60, 0.99]
+    # Inside Viterbi-LIVE: preserve soft boundary evidence up to 0.48
     p_calibrated = np.where(
         viterbi_state,
-        np.clip(0.55 + 0.44 * p_dead_snapped, 0.55, 0.99),
-        np.clip(0.42 * p_dead_snapped, 0.01, 0.44),
+        np.clip(0.60 + 0.39 * p_dead_snapped, 0.60, 0.99),
+        np.clip(0.65 * p_dead_snapped, 0.01, 0.48),
     ).astype(np.float32)
 
     return p_calibrated
@@ -409,8 +400,8 @@ def evaluate_deadball_on_public_gt(
     public_gt_path: Union[str, Path] = "evaluation/gt/BAR-ATH_possession_gt_public.csv",
 ) -> Optional[Dict[str, float]]:
     """
-    Weryfikuje jakość detekcji stanu D na 5-minutowym publicznym zbiorze kontrolnym
-    (klatki 11185..18684, zgodnie z EVALUATION.md i RULES.md wyłącznie do weryfikacji potoku).
+    Evaluates Dead-Ball detection quality on the 5-minute public sanity slice
+    (frames 11185..18684, strictly read-only pipeline verification per EVALUATION.md).
     """
     gt_path = Path(public_gt_path)
     if not gt_path.exists():
@@ -435,7 +426,6 @@ def evaluate_deadball_on_public_gt(
     recall = tp / max(tp + fn, 1)
     f1_d = 2.0 * precision * recall / max(precision + recall, 1e-8)
 
-    # Liczba segmentów D w oknie publicznym
     pad_true = np.concatenate([[False], true_d, [False]])
     n_true_spells = int(np.sum(pad_true[1:] & ~pad_true[:-1]))
 
@@ -462,17 +452,17 @@ def run_deadball_pipeline(
     public_gt_path: Optional[Union[str, Path]] = None,
 ) -> pd.DataFrame:
     """
-    Główny potok modelu stanu D (Top 1%):
-    Domyślnie public_gt_path=None gwarantuje 100% separacji od pliku Ground Truth w przebiegu produkcyjnym.
+    Main Role 3 Dead-Ball estimation pipeline.
+    Produces calibrated out-of-play probabilities P(D) and set-piece context columns.
     """
     stage1_path = Path(stage1_parquet_path)
     if not stage1_path.exists():
-        raise FileNotFoundError(f"Nie znaleziono pliku wejściowego Stage 1: {stage1_path}")
+        raise FileNotFoundError(f"Stage 1 input file not found: {stage1_path}")
 
     stage1_df = pd.read_parquet(stage1_path)
     if len(stage1_df) != N_FRAMES:
         raise ValueError(
-            f"Oczekiwano {N_FRAMES} klatek w stage1_tracking.parquet, otrzymano {len(stage1_df)}."
+            f"Expected {N_FRAMES} frames in stage1_tracking.parquet, got {len(stage1_df)}."
         )
 
     if "frame_id" in stage1_df.columns:
@@ -509,12 +499,12 @@ def run_deadball_pipeline(
             & (~stage1_df["brd_ball_x"].isna().to_numpy())
         )
 
-    p_in_window = 0.44 * sp_prior_prob + 0.56 * kin_score
-    oob_confident = ball_oob & (ball_visible | (kin_score > 0.56))
+    p_in_window = 0.48 * sp_prior_prob + 0.52 * kin_score
+    oob_confident = ball_oob & (ball_visible | (kin_score > 0.48))
     p_out_window = np.where(
         oob_confident,
-        np.clip(0.54 + 0.42 * kin_score, 0.0, 0.95),
-        np.clip((kin_score - 0.35) * 0.85 - live_suppression, 0.0, 0.72),
+        np.clip(0.58 + 0.38 * kin_score, 0.0, 0.96),
+        np.clip((kin_score - 0.30) * 0.95 - 0.75 * live_suppression, 0.0, 0.78),
     )
 
     p_dead_raw = np.where(is_sp_window, p_in_window, p_out_window).astype(np.float32)
@@ -554,9 +544,9 @@ def run_deadball_pipeline(
         death_flux=death_flux,
         restart_flux=restart_flux,
         period_arr=period_arr,
-        base_switch_penalty=14.0,
-        min_live_gap_frames=45,
-        min_dead_duration_frames=65,
+        base_switch_penalty=8.5,
+        min_live_gap_frames=22,
+        min_dead_duration_frames=25,
     )
 
     if "period" in stage1_df.columns:
@@ -593,25 +583,24 @@ def run_deadball_pipeline(
         "restart_team_hint": pd.Categorical(restart_hint, categories=["H", "A"]),
     })
 
-    assert len(result_df) == N_FRAMES, f"Błędna liczba wierszy: {len(result_df)} != {N_FRAMES}"
-    assert not result_df["frame_id"].isna().any(), "Kolumna 'frame' zawiera wartości NaN!"
-    assert not result_df["p_dead"].isna().any(), "Kolumna 'p_dead' zawiera wartości NaN!"
-    assert not result_df["is_set_piece_window"].isna().any(), "Kolumna 'is_set_piece_window' zawiera NaN!"
-    assert (result_df["frame_id"].to_numpy() == np.arange(N_FRAMES)).all(), "Naruszenie kolejności klatek 0..199318!"
+    assert len(result_df) == N_FRAMES, f"Invalid row count: {len(result_df)} != {N_FRAMES}"
+    assert not result_df["frame_id"].isna().any(), "Column 'frame_id' contains NaN values!"
+    assert not result_df["p_dead"].isna().any(), "Column 'p_dead' contains NaN values!"
+    assert not result_df["is_set_piece_window"].isna().any(), "Column 'is_set_piece_window' contains NaN!"
+    assert (result_df["frame_id"].to_numpy() == np.arange(N_FRAMES)).all(), "Frame ordering violation 0..199318!"
 
     output_path = Path(output_parquet_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result_df.to_parquet(output_path, index=False)
 
-    # Sanity-check uruchamiany wyłącznie na jawne żądanie użytkownika
     if public_gt_path is not None:
         diag = evaluate_deadball_on_public_gt(result_df, public_gt_path=public_gt_path)
         if diag is not None:
             print(
                 f"[Sanity-Check 5-min Public GT] D_F1={diag['d_f1']:.4f} "
                 f"(Prec={diag['d_precision']:.4f}, Rec={diag['d_recall']:.4f}) | "
-                f"Klatki D: pred={diag['pred_d_frames']} vs gt={diag['true_d_frames']} | "
-                f"Segmenty D: pred={diag['pred_d_segments']} vs gt={diag['true_d_segments']}"
+                f"D Frames: pred={diag['pred_d_frames']} vs gt={diag['true_d_frames']} | "
+                f"D Segments: pred={diag['pred_d_segments']} vs gt={diag['true_d_segments']}"
             )
 
     return result_df
@@ -620,35 +609,35 @@ def run_deadball_pipeline(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Generowanie stage2_deadball.parquet (Top 1% Dead-Ball Model).")
+    parser = argparse.ArgumentParser(description="Generate stage2_deadball.parquet (Role 3 Dead-Ball Model).")
     parser.add_argument(
         "--stage1",
         type=str,
         default="data/interim/stage1_tracking.parquet",
-        help="Ścieżka do pliku stage1_tracking.parquet",
+        help="Path to stage1_tracking.parquet",
     )
     parser.add_argument(
         "--xml",
         type=str,
         default="data/tactical/BAR-ATH_tactical_smart_tagging.xml",
-        help="Ścieżka do pliku BAR-ATH_tactical_smart_tagging.xml",
+        help="Path to BAR-ATH_tactical_smart_tagging.xml",
     )
     parser.add_argument(
         "--output",
         type=str,
         default="data/interim/stage2_deadball.parquet",
-        help="Ścieżka wyjściowa dla pliku stage2_deadball.parquet",
+        help="Output path for stage2_deadball.parquet",
     )
     parser.add_argument(
         "--check-public-gt",
         action="store_true",
-        help="Uruchamia wyłącznie odczytowy sanity-check potoku na 5-minutowym publicznym GT",
+        help="Run read-only sanity check on the 5-minute public GT slice",
     )
     parser.add_argument(
         "--public-gt",
         type=str,
         default="evaluation/gt/BAR-ATH_possession_gt_public.csv",
-        help="Ścieżka do publicznego 5-minutowego GT (używana tylko gdy podano --check-public-gt)",
+        help="Path to public 5-minute GT CSV",
     )
     args = parser.parse_args()
 
@@ -661,4 +650,4 @@ if __name__ == "__main__":
         output_parquet_path=args.output,
         public_gt_path=gt_file,
     )
-    print(f"Zapisano pomyślnie {len(df_out)} klatek do {args.output}.")
+    print(f"Successfully saved {len(df_out)} frames to {args.output}.")
