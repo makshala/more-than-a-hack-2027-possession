@@ -102,6 +102,23 @@ class TestPossessionDecodingEcosystem(unittest.TestCase):
         self.assertEqual(metrics["excess_fragments"], 0)
 
 
+    def test_sandwich_micro_possession_merging(self):
+        # Scenario: H H H H H A A A H H H H H (sandwich of 3 frames of A inside H)
+        # 3 frames of A is 120ms at 25 fps, which should be merged into H
+        raw_states = np.array([0]*30 + [1]*3 + [0]*30, dtype=np.int32)
+        cleaned = PossessionSpellExtractor.suppress_micro_possessions(
+            raw_states, fps=25.0, sandwich_max_ms=1600.0
+        )
+        # All 63 frames must now be 0 (Home)
+        self.assertTrue(np.all(cleaned == 0))
+
+        # Scenario with Dead Ball: A A A D D A A A (short 2-frame dead ball inside Away)
+        raw_states2 = np.array([1]*25 + [2]*2 + [1]*25, dtype=np.int32)
+        cleaned2 = PossessionSpellExtractor.suppress_micro_possessions(
+            raw_states2, fps=25.0, sandwich_max_ms=1600.0
+        )
+        self.assertTrue(np.all(cleaned2 == 1))
+
     def test_role4_parquet_integration(self):
         import os, json
         parquet_path = "role5_probabilities.parquet"
