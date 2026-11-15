@@ -587,17 +587,17 @@ def run_deadball_pipeline(
         restart_hint[missing_hint_mask & (team_signal < 0.0)] = "A"
 
     result_df = pd.DataFrame({
-        "frame": np.arange(N_FRAMES, dtype=np.int32),
+        "frame_id": np.arange(N_FRAMES, dtype=np.int32),
         "p_dead": p_dead,
         "is_set_piece_window": is_sp_window.astype(bool),
         "restart_team_hint": pd.Categorical(restart_hint, categories=["H", "A"]),
     })
 
     assert len(result_df) == N_FRAMES, f"Błędna liczba wierszy: {len(result_df)} != {N_FRAMES}"
-    assert not result_df["frame"].isna().any(), "Kolumna 'frame' zawiera wartości NaN!"
+    assert not result_df["frame_id"].isna().any(), "Kolumna 'frame' zawiera wartości NaN!"
     assert not result_df["p_dead"].isna().any(), "Kolumna 'p_dead' zawiera wartości NaN!"
     assert not result_df["is_set_piece_window"].isna().any(), "Kolumna 'is_set_piece_window' zawiera NaN!"
-    assert (result_df["frame"].to_numpy() == np.arange(N_FRAMES)).all(), "Naruszenie kolejności klatek 0..199318!"
+    assert (result_df["frame_id"].to_numpy() == np.arange(N_FRAMES)).all(), "Naruszenie kolejności klatek 0..199318!"
 
     output_path = Path(output_parquet_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
