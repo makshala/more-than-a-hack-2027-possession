@@ -10,6 +10,7 @@ from scipy.ndimage import binary_closing, binary_opening
 from config import (
     DEFAULT_FPS, STATE_MAP, INV_STATE_MAP, ms_to_frames, frames_to_ms,
     DEFAULT_CLOSING_KERNEL_MS, DEFAULT_OPENING_KERNEL_MS,
+    PHYSICAL_MIN_DURATIONS_MS, SANDWICH_MERGE_MAX_MS,
     HYSTERESIS_CERTAINTY_THRESHOLD, HYSTERESIS_MARGIN_THRESHOLD
 )
 
@@ -170,7 +171,11 @@ class PossessionSpellExtractor:
             else:
                 best_local_offset = np.argmax(gradient_scores)
 
-            ideal_boundary = w_start + best_local_offset
+            candidate_boundary = w_start + best_local_offset
+            # Bound the maximum shift to protect adjacent segments from collapsing into micro-slivers
+            max_shift = max(1, window_frames // 3)
+            ideal_boundary = int(np.clip(candidate_boundary, b_idx - max_shift, b_idx + max_shift))
+
             # Snap boundary
             if ideal_boundary < b_idx:
                 snapped_states[ideal_boundary:b_idx] = next_s
@@ -178,6 +183,108 @@ class PossessionSpellExtractor:
                 snapped_states[b_idx:ideal_boundary] = prev_s
 
         return snapped_states
+
+    @classmethod
+    def suppress_micro_possessions(
+        cls,
+        decoded_states: np.ndarray,
+        df_probs: Optional[pd.DataFrame] = None,
+        min_durations_ms: Optional[Dict[int, float]] = None,
+        sandwich_max_ms: float = SANDWICH_MERGE_MAX_MS,
+        fps: float = DEFAULT_FPS
+    ) -> np.ndarray:
+        """
+        Suppresses physically impossible micro-possessions and merges transient interruptions.
+
+        1. Sandwich / Island Merging:
+           Resolves sequences like H H A H H -> H H H H H or A A D A A -> A A A A A
+           where an interruption shorter than sandwich_max_ms immediately reverts to the
+           surrounding state.
+
+        2. Physical Minimum Duration Enforcement:
+           Absorbs any remaining micro-segment shorter than min_durations_ms (e.g. < 1000ms for H/A,
+           < 600ms for D) into the adjacent neighbor with higher cumulative evidence or longer duration.
+        """
+        n = len(decoded_states)
+        if n <= 1:
+            return decoded_states.copy()
+
+        min_ms_map = min_durations_ms if min_durations_ms is not None else PHYSICAL_MIN_DURATIONS_MS
+        min_frames_map = {
+            s: ms_to_frames(min_ms_map.get(s, 600.0), fps)
+            for s in [0, 1, 2]
+        }
+        bridge_max_frames = ms_to_frames(sandwich_max_ms, fps)
+
+        # RLE into segments: list of [state, start, end]
+        diffs = np.where(np.diff(decoded_states) != 0)[0] + 1
+        starts = np.insert(diffs, 0, 0)
+        ends = np.append(diffs - 1, n - 1)
+        segments = [[int(decoded_states[s]), int(s), int(e)] for s, e in zip(starts, ends)]
+
+        # Pass 1: Sandwich / Bridge elimination (e.g. H H A H H -> H H H H H)
+        changed = True
+        it = 0
+        while changed and it < 20:
+            changed = False
+            it += 1
+            for i in range(1, len(segments) - 1):
+                st, s, e = segments[i]
+                dur = e - s + 1
+                prev_st = segments[i - 1][0]
+                next_st = segments[i + 1][0]
+                if prev_st == next_st and prev_st != st and dur <= bridge_max_frames:
+                    segments[i][0] = prev_st
+                    changed = True
+
+            # Consolidate adjacent identical states
+            consolidated = []
+            for seg in segments:
+                if consolidated and consolidated[-1][0] == seg[0]:
+                    consolidated[-1][2] = seg[2]
+                else:
+                    consolidated.append(seg)
+            segments = consolidated
+
+        # Pass 2: Absorb any remaining segments below physical minimum
+        changed = True
+        it = 0
+        while changed and it < 30:
+            changed = False
+            if len(segments) <= 1:
+                break
+
+            for i in range(len(segments)):
+                st, s, e = segments[i]
+                dur = e - s + 1
+                if dur < min_frames_map.get(st, 15):
+                    if 0 < i < len(segments) - 1:
+                        left_st, left_s, left_e = segments[i - 1]
+                        right_st, right_s, right_e = segments[i + 1]
+                        left_dur = left_e - left_s + 1
+                        right_dur = right_e - right_s + 1
+                        target_st = left_st if left_dur >= right_dur else right_st
+                        segments[i][0] = target_st
+                    elif i > 0:
+                        segments[i][0] = segments[i - 1][0]
+                    else:
+                        segments[i][0] = segments[i + 1][0]
+                    changed = True
+                    break
+
+            consolidated = []
+            for seg in segments:
+                if consolidated and consolidated[-1][0] == seg[0]:
+                    consolidated[-1][2] = seg[2]
+                else:
+                    consolidated.append(seg)
+            segments = consolidated
+
+        # Reconstruct state array
+        out = np.empty(n, dtype=np.int32)
+        for st, s, e in segments:
+            out[s:e + 1] = st
+        return out
 
     @classmethod
     def extract_spells(
@@ -225,7 +332,12 @@ class PossessionSpellExtractor:
                 clean_states, df_probs=df_source, window_ms=closing_ms, fps=fps
             )
 
-        # Step 3: Run-Length Aggregation into Continuous Tactical Spells
+        # Step 3: Physical Micro-Possession Suppression & Sandwich Merging (H H A H H -> H H H H H)
+        clean_states = cls.suppress_micro_possessions(
+            clean_states, df_probs=df_source, fps=fps
+        )
+
+        # Step 4: Run-Length Aggregation into Continuous Tactical Spells
         state_changes = np.diff(clean_states) != 0
         split_indices = np.where(state_changes)[0] + 1
 
