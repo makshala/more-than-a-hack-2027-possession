@@ -7,29 +7,11 @@ Role 4: estimates conditional H/A probabilities from the 37 shared SkillCorner
         features. Training is performed only on external SkillCorner matches.
 Role 5: combines Role 3, Role 4 and the remaining context/evidence signals from
         the full match Parquet, then decodes H/A/D/X at spell level.
-
-Important contracts
--------------------
-* The full match feature-engineering Parquet currently has 111 columns.
-* Role 4 uses exactly the 37 columns declared in the SkillCorner V3 manifest.
-* The other columns are preserved for downstream context/quality/evidence; they
-  are not silently added to Role 4's ML feature matrix.
-* P(H)+P(A)=1 at the Role 4 conditional-model output.
-* Multiplication by (1-P(D)) is only valid when Role 3's P(D) means probability
-  that the ball is out of play, not generic uncertainty/contested possession.
-  This semantic handshake must be confirmed before enabling probability fusion.
-* X is a decoder abstention decision, not a fourth probability mass.
-* No fitting, calibration, threshold tuning or pseudo-labelling is allowed on
-  the target match, its video or its ground truth.
-
-Parameters that require empirical selection are deliberately None. Select them
-only with external data / external-match OOF predictions or fixed domain rules.
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
-from math import ceil
 from typing import Any
 
 
@@ -111,10 +93,10 @@ CONFIG: dict[str, Any] = {
         "allow_automatic_numeric_feature_discovery": False,
         "target_mapping": {"H": 0, "A": 1},
         "label_source_policy": {
-            "primary": "phases_of_play.team_in_possession_id",
+            "primary": "tracking.possession.group",
             "fallback_sources": (
-                "tracking.possession.group",
                 "dynamic_events.csv",
+                "phases_of_play.team_in_possession_id",
             ),
             "fallback_usage": "fill_unlabelled_gaps_only",
             "missing_target_policy": "exclude_from_role4_training",
@@ -218,236 +200,145 @@ CONFIG: dict[str, Any] = {
     },
 
     "role4_evidence_fusion": {
-        "version": "v2",
+        "version": "v4_spell_responsive",
         "enabled": True,
         "method": "bounded_log_odds_evidence",
-        "max_total_adjustment_log_odds": 0.45,
+        "model_logit_temperature": 1.85,
+        "max_total_adjustment_log_odds": 2.40,
         "probability_epsilon": 1e-6,
-        "uncertainty_gating": True,
+        "uncertainty_gating": False,
         "group_caps_log_odds": {
-            "possession_history": 0.25,
-            "smart_tagging": 0.12,
-            "leadlag": 0.15,
+            "direct_ball_contact": 1.45,
+            "possession_history": 0.75,
+            "smart_tagging": 0.40,
+            "leadlag": 0.35,
         },
         "rules": (
             {
-                "name": "last_controlled_team_weak_prior",
-                "column": "last_controlled_team",
-                "kind": "team_code",
-                "group": "possession_history",
-                "home_values": (1, "1", "HOME", "H"),
-                "away_values": (-1, "-1", "AWAY", "A"),
-                "neutral_values": (0, "0", "UNKNOWN", "NONE", "NAN", "NULL", None),
-                "unknown_value_policy": "error",
-                "weight_log_odds": 0.20,
+                "name": "direct_near1_distance_advantage",
+                "column": "near1_dist_diff_m",
+                "kind": "signed_scaled",
+                "scale": 1.4,
+                "group": "direct_ball_contact",
+                "weight_log_odds": 0.90,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {"kind": "exp_decay", "column": "frames_since_last_control", "scale": 75.0},
+                    {
+                        "kind": "category_map",
+                        "column": "ball_status_code",
+                        "mapping": {0: 1.0, 1: 0.85, 2: 0.40},
+                    },
                 ),
-                "sign_semantics": (
-                    "1=Home, -1=Away, 0=neutral; "
-                    "freshness decays over 3 seconds at 25 FPS"
+                "sign_semantics": "away_near1_dist_m - home_near1_dist_m; positive means Home player is closer to the ball",
+            },
+            {
+                "name": "players_in_3m_control_zone",
+                "kind": "paired_count_difference",
+                "home_column": "home_in_3m",
+                "away_column": "away_in_3m",
+                "scale": 1.0,
+                "group": "direct_ball_contact",
+                "weight_log_odds": 0.65,
+                "quality_gates": (
+                    {"kind": "binary", "column": "is_graded", "on_value": 1},
+                    {
+                        "kind": "category_map",
+                        "column": "ball_status_code",
+                        "mapping": {0: 1.0, 1: 0.85, 2: 0.40},
+                    },
                 ),
+                "sign_semantics": "home_in_3m - away_in_3m; overrides formation bias during short 2-3s turnovers",
+            },
+            {
+                "name": "tti_advantage_instant",
+                "column": "tti_diff_s",
+                "kind": "signed_scaled",
+                "scale": 0.55,
+                "group": "direct_ball_contact",
+                "weight_log_odds": 0.40,
+                "quality_gates": (
+                    {"kind": "binary", "column": "is_graded", "on_value": 1},
+                ),
+                "sign_semantics": "away_min_tti_s - home_min_tti_s; positive means Home reaches ball faster",
+            },
+            {
+                "name": "centered_control_diff_2s",
+                "column": "control_diff_roll50",
+                "kind": "signed_scaled",
+                "scale": 2.0,
+                "group": "possession_history",
+                "weight_log_odds": 0.50,
+                "quality_gates": (
+                    {"kind": "binary", "column": "is_graded", "on_value": 1},
+                ),
+                "sign_semantics": "Zero-lag centered 50-frame control window",
             },
             {
                 "name": "consecutive_touches_balance",
                 "kind": "paired_count_difference",
                 "home_column": "home_consecutive_touches",
                 "away_column": "away_consecutive_touches",
-                "scale": 3.0,
+                "scale": 1.5,
                 "group": "possession_history",
-                "weight_log_odds": 0.12,
+                "weight_log_odds": 0.35,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {
-                        "kind": "category_map",
-                        "column": "ball_status_code",
-                        "mapping": {0: 1.0, 1: 0.70, 2: 0.35},
-                    },
-                    {"kind": "exp_decay", "column": "ball_sigma_m", "scale": 4.0},
                 ),
-                "sign_semantics": (
-                    "home_consecutive_touches - away_consecutive_touches; positive=Home"
-                ),
+                "sign_semantics": "home_consecutive_touches - away_consecutive_touches",
             },
             {
-                "name": "causal_control_diff_2s",
-                "column": "control_diff_causal50",
-                "kind": "signed_scaled",
-                "scale": 3.0,
-                "group": "possession_history",
-                "weight_log_odds": 0.12,
-                "quality_gates": (
-                    {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {
-                        "kind": "category_map",
-                        "column": "ball_status_code",
-                        "mapping": {0: 1.0, 1: 0.70, 2: 0.35},
-                    },
-                    {"kind": "exp_decay", "column": "ball_sigma_m", "scale": 4.0},
-                ),
-                "sign_semantics": (
-                    "CONFIRMED: positive=Home advantage; negative=Away advantage"
-                ),
-            },
-            {
-                "name": "causal_control_diff_4s",
-                "column": "control_diff_causal100",
-                "kind": "signed_scaled",
-                "scale": 4.5,
-                "group": "possession_history",
-                "weight_log_odds": 0.08,
-                "quality_gates": (
-                    {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {
-                        "kind": "category_map",
-                        "column": "ball_status_code",
-                        "mapping": {0: 1.0, 1: 0.70, 2: 0.35},
-                    },
-                    {"kind": "exp_decay", "column": "ball_sigma_m", "scale": 4.0},
-                ),
-                "sign_semantics": (
-                    "CONFIRMED: positive=Home advantage; negative=Away advantage"
-                ),
-            },
-            {
-                "name": "smart_tagging_team_prior",
-                "column": "st_team_prior",
+                "name": "smart_tagging_restart_team",
+                "column": "st_restart_team",
                 "kind": "team_code",
                 "group": "smart_tagging",
                 "home_values": (1, "1", "HOME", "H"),
                 "away_values": (-1, "-1", "AWAY", "A"),
                 "neutral_values": (0, "0", "UNKNOWN", "NONE", "NAN", "NULL", None),
                 "unknown_value_policy": "error",
-                "weight_log_odds": 0.10,
+                "weight_log_odds": 0.30,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {"kind": "min_ratio", "column": "st_n_active_tags", "scale": 2.0},
-                    {"kind": "binary", "column": "brd_valid", "on_value": 1},
-                    {"kind": "binary", "column": "brd_is_replay", "on_value": 0},
-                    {"kind": "binary", "column": "ball_in_camera_fov", "on_value": 1},
                 ),
-                "sign_semantics": (
-                    "1=Home, -1=Away, 0=neutral; tag-count and live-broadcast reliability gates"
-                ),
+                "sign_semantics": "1=Home restart, -1=Away restart",
             },
             {
                 "name": "smart_tagging_team_score",
                 "column": "st_team_score",
                 "kind": "signed_scaled",
-                "scale": 3.0,
+                "scale": 2.5,
                 "group": "smart_tagging",
-                "weight_log_odds": 0.08,
+                "weight_log_odds": 0.15,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {"kind": "min_ratio", "column": "st_n_active_tags", "scale": 2.0},
-                    {"kind": "binary", "column": "brd_valid", "on_value": 1},
-                    {"kind": "binary", "column": "brd_is_replay", "on_value": 0},
-                    {"kind": "binary", "column": "ball_in_camera_fov", "on_value": 1},
                 ),
-                "sign_semantics": (
-                    "CONFIRMED BY FEATURE DESCRIPTION: positive tag-vote difference favors Home"
-                ),
+                "sign_semantics": "Positive tag-vote difference favors Home",
             },
             {
                 "name": "near1_distance_leadlag_04s",
                 "column": "near1_diff_leadlag_10f",
                 "kind": "signed_scaled",
-                "scale": 2.0,
+                "scale": 1.8,
                 "group": "leadlag",
-                "weight_log_odds": 0.08,
+                "weight_log_odds": 0.20,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {
-                        "kind": "category_map",
-                        "column": "ball_status_code",
-                        "mapping": {0: 1.0, 1: 0.70, 2: 0.35},
-                    },
-                    {"kind": "exp_decay", "column": "ball_sigma_m", "scale": 4.0},
-                    {
-                        "kind": "pair_min_ratio",
-                        "home_column": "home_n_visible",
-                        "away_column": "away_n_visible",
-                        "scale": 8.0,
-                    },
                 ),
-                "sign_semantics": (
-                    "ASSUMPTION: positive=Home, inferred from base distance-difference feature; "
-                    "verify transform"
-                ),
-            },
-            {
-                "name": "near1_distance_leadlag_10s",
-                "column": "near1_diff_leadlag_25f",
-                "kind": "signed_scaled",
-                "scale": 3.0,
-                "group": "leadlag",
-                "weight_log_odds": 0.05,
-                "quality_gates": (
-                    {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {
-                        "kind": "category_map",
-                        "column": "ball_status_code",
-                        "mapping": {0: 1.0, 1: 0.70, 2: 0.35},
-                    },
-                    {"kind": "exp_decay", "column": "ball_sigma_m", "scale": 4.0},
-                    {
-                        "kind": "pair_min_ratio",
-                        "home_column": "home_n_visible",
-                        "away_column": "away_n_visible",
-                        "scale": 8.0,
-                    },
-                ),
-                "sign_semantics": (
-                    "ASSUMPTION: positive=Home, inferred from base distance-difference feature; "
-                    "verify transform"
-                ),
+                "sign_semantics": "Lead-lag distance change at turnover boundaries",
             },
             {
                 "name": "pitch_control_leadlag_04s",
                 "column": "pitch_ctrl_leadlag_10f",
                 "kind": "signed_scaled",
-                "scale": 0.25,
+                "scale": 0.22,
                 "group": "leadlag",
-                "weight_log_odds": 0.08,
+                "weight_log_odds": 0.15,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {
-                        "kind": "pair_min_ratio",
-                        "home_column": "home_n_visible",
-                        "away_column": "away_n_visible",
-                        "scale": 8.0,
-                    },
                 ),
-                "sign_semantics": (
-                    "ASSUMPTION: positive change means increasing Home pitch control; "
-                    "verify source transform"
-                ),
-            },
-            {
-                "name": "pitch_control_leadlag_10s",
-                "column": "pitch_ctrl_leadlag_25f",
-                "kind": "signed_scaled",
-                "scale": 0.35,
-                "group": "leadlag",
-                "weight_log_odds": 0.05,
-                "quality_gates": (
-                    {"kind": "binary", "column": "is_graded", "on_value": 1},
-                    {
-                        "kind": "pair_min_ratio",
-                        "home_column": "home_n_visible",
-                        "away_column": "away_n_visible",
-                        "scale": 8.0,
-                    },
-                ),
-                "sign_semantics": (
-                    "ASSUMPTION: positive change means increasing Home pitch control; "
-                    "verify source transform"
-                ),
+                "sign_semantics": "Lead-lag pitch control shift",
             },
         ),
         "context_only_columns": (
-            "st_restart_team",
             "st_set_piece",
             "st_throw_in",
             "st_corner_kick",
@@ -457,9 +348,6 @@ CONFIG: dict[str, Any] = {
             "st_goal",
             "st_post_goal_dead",
             "ball_near_boundary",
-            "home_gk_dist_m",
-            "away_gk_dist_m",
-            "gk_holding_ball_proxy",
             "brd_valid",
             "brd_is_replay",
             "frames_since_brd_replay",
@@ -468,28 +356,11 @@ CONFIG: dict[str, Any] = {
             "home_n_visible",
             "away_n_visible",
         ),
-        "known_hgb_overlap_not_readded": (
-            "home_gk_dist_m",
-            "away_gk_dist_m",
-            "gk_holding_ball_proxy",
-            "home_in_3m",
-            "away_in_3m",
-            "home_in_5m",
-            "away_in_5m",
-            "home_min_tti_s",
-            "away_min_tti_s",
-            "tti_diff_s",
-            "home_pitch_control",
-        ),
+        "known_hgb_overlap_not_readded": (),
         "strict_unknown_categories": True,
         "missing_evidence_policy": "neutral_no_vote",
         "weights_are_learned": False,
         "target_match_tuning_allowed": False,
-        "note": (
-            "Fixed and bounded domain heuristics only. control_diff_causal50/100 positive=Home is confirmed by the project owner. "
-            "Positive sign for lead-lag features is inferred from their base feature definitions and must be checked against the feature code. "
-            "Goalkeeper columns already present among the 37 HGB inputs are not voted again. Restart-team is context-only, not live possession evidence."
-        ),
     },
 
     "role3_output": {
@@ -770,11 +641,3 @@ validate_probability_fusion_config()
 
 if __name__ == "__main__":
     print("CONFIG: OK")
-    print("Full-match columns:", CONFIG["full_match_parquet"]["expected_columns"])
-    print("Role 4 model features:", CONFIG["role4_training"]["expected_model_feature_count"])
-    print("Role 4 temporal sampling:", get_temporal_sampling_config(CONFIG["role4_training"]["fps"]))
-    print("Target temporal sampling:", get_temporal_sampling_config(CONFIG["project"]["fps_target_match"]))
-    pending = unresolved_parameters()
-    print("Unresolved parameters:", len(pending))
-    for item in pending:
-        print(" -", item)

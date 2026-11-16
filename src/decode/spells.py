@@ -3,7 +3,7 @@ Possession Spell Extraction with 1D Morphological Filtering and Temporal Hystere
 Applies temporal closing and opening to bridge tracking micro-gaps and remove transient flickers,
 snapping transition boundaries to the nearest stable tracking frames to resolve borderline uncertainty.
 """
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 from scipy.ndimage import binary_closing, binary_opening
@@ -320,9 +320,9 @@ class PossessionSpellExtractor:
 
         # Step 1: 1D Morphological Filtering
         if apply_morphology:
-            clean_states = cls.apply_morphological_filtering(
-                clean_states, df_probs=df_source, closing_ms=closing_ms,
-                opening_ms=opening_ms, fps=fps
+            clean_states = cls.suppress_micro_possessions(
+                clean_states, df_probs=df_source, fps=fps
+            
             )
 
         # Step 2: Temporal Hysteresis & Boundary Edge Snapping

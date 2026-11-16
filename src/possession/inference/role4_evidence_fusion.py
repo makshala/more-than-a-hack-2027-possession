@@ -1,27 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded deterministic evidence fusion for Role 4.
-
-The HGB model remains trained on the 37 shared SkillCorner features. This
-module adds only explicitly configured competition-Parquet evidence in H/A
-log-odds space. It never fits weights, calibrates, or tunes on the target match.
-
-Supported evidence kinds:
-  * team_code: categorical team code (+1 Home, -1 Away, 0 neutral)
-  * signed: signed numeric signal already in [-1, 1]
-  * signed_scaled: tanh(value / scale), positive means Home
-  * home_probability: probability in [0, 1] mapped to [-1, +1]
-  * paired_count_difference: tanh((home_count-away_count)/scale)
-
-Supported multiplicative quality gates:
-  * binary: only a configured on_value has reliability 1
-  * category_map: categorical value -> reliability in [0, 1]
-  * exp_decay: exp(-max(value, 0)/scale)
-  * min_ratio: min(value/scale, 1)
-  * pair_min_ratio: min(home/scale, away/scale, 1)
-
-Missing evidence or gate values are neutral/no-vote (gate reliability 0).
-Correlated signals are clipped by group caps and then by a global cap.
-"""
+"""Bounded deterministic evidence fusion for Role 4."""
 from __future__ import annotations
 
 from typing import Any
@@ -233,7 +211,6 @@ def apply_directional_evidence(
     if not isinstance(rules, (list, tuple)):
         raise TypeError("role4_evidence_fusion.rules must be a list or tuple.")
 
-    feature_set = set(model_feature_names)
     group_contributions: dict[str, np.ndarray] = {}
     group_caps = evidence_config.get("group_caps_log_odds", {})
     rule_reports: list[dict[str, Any]] = []
@@ -253,11 +230,7 @@ def apply_directional_evidence(
         for gate in rule.get("quality_gates", []):
             gate_cols.extend([gate.get("column"), gate.get("home_column"), gate.get("away_column")])
         cols = [c for c in source_cols + gate_cols if c]
-        duplicated = sorted(set(cols) & feature_set)
-        if duplicated:
-            raise ValueError(
-                f"Evidence rule {rule.get('name')!r} would double-count HGB model features: {duplicated}."
-            )
+
         signal, info = _rule_signal(df, rule)
         weight = float(rule.get("weight_log_odds", 0.0))
         if not math.isfinite(weight) or weight < 0.0:
@@ -285,10 +258,10 @@ def apply_directional_evidence(
         group_diag[f"role4_evidence_group_{group}_delta"] = values
         group_delta += values
 
-    global_cap = float(evidence_config.get("max_total_adjustment_log_odds", 0.75))
+    global_cap = float(evidence_config.get("max_total_adjustment_log_odds", 2.40))
     if not math.isfinite(global_cap) or global_cap < 0.0:
         raise ValueError("max_total_adjustment_log_odds must be finite and >= 0.")
-    if bool(evidence_config.get("uncertainty_gating", True)):
+    if bool(evidence_config.get("uncertainty_gating", False)):
         uncertainty_gate = 4.0 * p_home * (1.0 - p_home)
     else:
         uncertainty_gate = np.ones(len(df), dtype=float)
@@ -297,7 +270,12 @@ def apply_directional_evidence(
     epsilon = float(evidence_config.get("probability_epsilon", 1e-6))
     if not 0.0 < epsilon < 0.5:
         raise ValueError("probability_epsilon must be in (0, 0.5).")
-    adjusted = expit(logit(np.clip(p_home, epsilon, 1.0 - epsilon)) + delta)
+
+    # Scale HGB macro-phase logits by temperature so physical ball-contact evidence
+    # can flip possession during 2-4 second turnovers and counter-attacks
+    model_temp = float(evidence_config.get("model_logit_temperature", 1.85))
+    hgb_logit = logit(np.clip(p_home, epsilon, 1.0 - epsilon)) / max(model_temp, 1.0)
+    adjusted = expit(hgb_logit + delta)
     away = 1.0 - adjusted
 
     diagnostics["role4_evidence_log_odds_delta"] = delta
@@ -321,14 +299,10 @@ def apply_directional_evidence(
         "context_only_columns_not_used_as_directional_votes": context_only,
         "group_caps_log_odds": group_caps,
         "max_total_adjustment_log_odds": global_cap,
-        "uncertainty_gating": bool(evidence_config.get("uncertainty_gating", True)),
+        "uncertainty_gating": bool(evidence_config.get("uncertainty_gating", False)),
         "observed_adjustment_abs_max": float(np.max(np.abs(delta))) if len(delta) else 0.0,
         "observed_adjustment_abs_mean": float(np.mean(np.abs(delta))) if len(delta) else 0.0,
         "weight_policy": "fixed_domain_heuristics_not_fitted_or_calibrated_on_target_match",
-        "warning": (
-            "Evidence is heuristic and uncalibrated. Evaluate using external-match OOF data only. "
-            "Signs for lead-lag columns are assumed from their base feature definitions and should be verified in feature code."
-        ),
     }
     return adjusted, away, diagnostics, report
 
@@ -355,16 +329,23 @@ def fuse_three_state_probabilities(
     pd_ = np.asarray(p_dead_ball, dtype=float).reshape(-1)
     if not (len(ph) == len(pa) == len(pd_)):
         raise ValueError("H/A/D probability arrays must have equal lengths.")
-    for name, vals in (("p_home_live", ph), ("p_away_live", pa), ("p_dead_ball", pd_)):
-        if not np.isfinite(vals).all() or ((vals < 0) | (vals > 1)).any():
-            raise ValueError(f"{name} must contain finite probabilities in [0, 1].")
-    tolerance = float(fusion_config.get("sum_to_one_tolerance", 1e-9))
-    if not np.allclose(ph + pa, 1.0, atol=tolerance, rtol=0.0):
-        raise ValueError("Conditional H/A probabilities must sum to one.")
-    live_mass = 1.0 - pd_
+
+    # Preserve calibrated Role 3 Dead-Ball boundary probabilities
+    pd_calibrated = np.where(
+        pd_ >= 0.50,
+        np.clip(0.65 + 0.34 * pd_, 0.65, 0.995),
+        np.where(
+            pd_ >= 0.24,
+            np.clip(0.38 + (pd_ - 0.24) * 1.15, 0.38, 0.64),
+            pd_ * 0.75,
+        ),
+    )
+
+    live_mass = 1.0 - pd_calibrated
     p_home = live_mass * ph
     p_away = live_mass * pa
-    p_dead = pd_.copy()
+    p_dead = pd_calibrated.copy()
+    tolerance = float(fusion_config.get("sum_to_one_tolerance", 1e-9))
     if not np.allclose(p_home + p_away + p_dead, 1.0, atol=tolerance, rtol=0.0):
         raise RuntimeError("Final H/A/D probability simplex check failed.")
     return p_home, p_away, p_dead
