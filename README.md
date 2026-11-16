@@ -119,24 +119,6 @@ uv run python src/decode/main.py \
 uv run python evaluation/validate_submission.py "evaluation/results/IAD AGH.csv"
 uv run python evaluation/run_evaluation.py
 ```
-
----
-
-## 📊 Evaluation Metrics & Benchmark Leaderboard
-
-The competition ranks submissions on **`spellF1`** — the mean F1 score of detected possession intervals matched one-to-one via Temporal Intersection over Union (`tIoU` across thresholds `0.3, 0.4, 0.5, 0.6, 0.7`), with frame-level **`macroF1`** over `{H, A, D}` as the primary tie-breaker.
-
-### Official Evaluation Scoreboard Comparison
-
-| Rank | Submission / Variant | `spellF1` *(Primary)* | `macroF1` | `poss` *(GT: 17)* | `dur` *(GT: 14.2s)* | `transF1` | `lat_f` | `shareE` | `frag` |
-| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **1** | **IAD AGH *(Spell-Optimal)*** | **0.4258** | **0.8135** | **16** | **13.9 s** | **0.2564** | **+0.8** | **0.014** | **0.95** |
-| 2 | `baseline_smooth125` | 0.4242 | 0.5812 | 16 | 18.5 s | 0.1667 | -7.7 | 0.052 | 0.81 |
-| — | **IAD AGH *(Structural / OOF)*** | **0.4000** | **0.8075** | **16** | **13.9 s** | **0.2927** | **+0.8** | **0.014** | **0.95** |
-| 3 | `baseline_smooth50` | 0.3256 | 0.6207 | 26 | 10.8 s | 0.0816 | +4.0 | 0.048 | 1.43 |
-| 4 | `baseline_smooth25` | 0.2868 | 0.6200 | 36 | 7.6 s | 0.2034 | +8.2 | 0.056 | 1.90 |
-| 5 | `baseline_raw` | 0.0378 | 0.5972 | 131 | 2.0 s | 0.1410 | -3.1 | 0.046 | 6.52 |
-
 ---
 
 ## 🛡️ Competition Compliance & Methodology
