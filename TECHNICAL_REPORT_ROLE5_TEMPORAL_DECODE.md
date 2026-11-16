@@ -307,7 +307,7 @@ src/decode/
 
 ---
 
-### 7.1 [main.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/main.py) — Production Pipeline & Submission Exporter
+### 7.1 `main.py` — Production Pipeline & Submission Exporter
 The central execution engine and CLI entrypoint.
 * **Key Responsibilities**:
   - Coordinates ingestion of `role5_probabilities.parquet` and `sync_offset.json`.
@@ -320,7 +320,7 @@ The central execution engine and CLI entrypoint.
 
 ---
 
-### 7.2 [config.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/config.py) — Temporal Constants & Numerical Boundaries
+### 7.2 `config.py` — Temporal Constants & Numerical Boundaries
 Defines domain invariants, physical constraints, and numerical safety functions.
 * **Key Components**:
   - **Physical Constants in Milliseconds**:
@@ -339,7 +339,7 @@ Defines domain invariants, physical constraints, and numerical safety functions.
 
 ---
 
-### 7.3 [spells.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/spells.py) — Morphological Operations & Spell Extractor
+### 7.3 `spells.py` — Morphological Operations & Spell Extractor
 Implements `PossessionSpellExtractor` for post-trellis signal processing and discrete interval extraction.
 * **Key Functions**:
   - `apply_morphological_filtering(states, closing_ms, opening_ms, fps)`: executes 1D morphological closing (dilation followed by erosion to bridge dropouts) and opening (erosion followed by dilation to eliminate isolated 1-frame spikes).
@@ -350,7 +350,7 @@ Implements `PossessionSpellExtractor` for post-trellis signal processing and dis
 
 ---
 
-### 7.4 [diagnostics.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/diagnostics.py) — Temporal IoU & SpellF1 Evaluation Suite
+### 7.4 `diagnostics.py` — Temporal IoU & SpellF1 Evaluation Suite
 Implements `TemporalDiagnostics` for rigorous evaluation of continuous tactical intervals.
 * **Key Functions**:
   - `compute_temporal_iou(start1, end1, start2, end2)`: calculates the Temporal Intersection over Union:
@@ -361,7 +361,7 @@ Implements `TemporalDiagnostics` for rigorous evaluation of continuous tactical 
 
 ---
 
-### 7.5 [viterbi_decoder.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/viterbi_decoder.py) — Log-Domain Viterbi with Dynamic Transitions
+### 7.5 `viterbi_decoder.py`— Log-Domain Viterbi with Dynamic Transitions
 Implements `ViterbiTemporalDecoder`.
 * **Key Features**:
   - Operates entirely in the numerically stable log-domain to eliminate underflow.
@@ -370,7 +370,7 @@ Implements `ViterbiTemporalDecoder`.
 
 ---
 
-### 7.6 [hsmm_decoder.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/hsmm_decoder.py) — Explicit-Duration Semi-Markov Trellis
+### 7.6 `hsmm_decoder.py` — Explicit-Duration Semi-Markov Trellis
 Implements `HSMMExplicitDurationDecoder` and `ContinuousDurationDistribution`.
 * **Key Features**:
   - Replaces the flawed geometric duration assumption of standard HMMs with continuous parametric **Gamma** ($f(d; k, \theta)$) or **Poisson** probability density functions.
@@ -381,7 +381,7 @@ Implements `HSMMExplicitDurationDecoder` and `ContinuousDurationDistribution`.
 
 ---
 
-### 7.7 [generator.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/generator.py) — Synthetic Markovian Telemetry Generator
+### 7.7 `generator.py` — Synthetic Markovian Telemetry Generator
 Implements `SyntheticPossessionGenerator` to simulate realistic match conditions and upstream tracking failures.
 * **Key Capabilities**:
   - Simulates 5 realistic noise regimes governed by an underlying Markov chain:
@@ -394,7 +394,7 @@ Implements `SyntheticPossessionGenerator` to simulate realistic match conditions
 
 ---
 
-### 7.8 [find_latency_oof.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/find_latency_oof.py) — Neural Network Latency Estimator
+### 7.8 `find_latency_oof.py` — Neural Network Latency Estimator
 Measures the temporal lag of upstream vision models using SkillCorner Out-Of-Fold (OOF) cross-validation data.
 * **Methodology**:
   - Automatically identifies probability and target columns regardless of column prefixes.
@@ -404,7 +404,7 @@ Measures the temporal lag of upstream vision models using SkillCorner Out-Of-Fol
 
 ---
 
-### 7.9 [tune_oof.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/tune_oof.py) — Optuna Bayesian Optimizer (Real OOF Data)
+### 7.9 `tune_oof.py` — Optuna Bayesian Optimizer (Real OOF Data)
 Calibrates decoding hyperparameters against real SkillCorner Out-of-Fold cross-validation data.
 * **Search Space**:
   - `shift`: temporal delay compensation (0 to 5 frames at 10 FPS).
@@ -417,14 +417,14 @@ Calibrates decoding hyperparameters against real SkillCorner Out-of-Fold cross-v
 
 ---
 
-### 7.10 [tune_synthetic.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/tune_synthetic.py) — Optuna Optimizer (Synthetic Simulations)
+### 7.10 `tune_synthetic.py` — Optuna Optimizer (Synthetic Simulations)
 Explores 7-dimensional hyperparameter space against worst-case synthetic tracking simulations across multiple independent seeds (42, 123, 999).
 * **Objective Function**: $\text{MacroF1} - 2.0 \times |\text{frag} - 1.0|$ (strictly penalizing both over-segmentation and under-segmentation).
 * Discovers globally robust parameters that prevent fragmentation in un-modeled optical environments.
 
 ---
 
-### 7.11 [test_decode.py](file:///Users/pawelryzewski/Desktop/Barcelona Hackathon/more-than-a-hack-2027-possession/src/decode/test_decode.py) — Unit & Integration Test Suite
+### 7.11 `test_decode.py` — Unit & Integration Test Suite
 Comprehensive testing module validating every mathematical and operational guarantee.
 * **Test Cases Covered**:
   1. `test_config_temporal_conversion`: Validates ms-to-frame and frame-to-ms scaling across variable FPS.
