@@ -14,6 +14,7 @@ import time
 import argparse
 import numpy as np
 import pandas as pd
+from hsmm_decoder import HSMMExplicitDurationDecoder
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -207,19 +208,17 @@ def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
     dead_col = "p_dead" if "p_dead" in df_half.columns else "p_dead_ball"
     p_d = df_half[dead_col].to_numpy(dtype=np.float64)
 
-    # 1. TIME-SHIFTING (Kompensacja opóźnienia)
+    # 1. Algorytmiczny Time-Shifting (skalowanie 10 -> 25 FPS)
     shift = 3
     if shift > 0:
         p_h = np.pad(p_h[shift:], (0, shift), mode='edge')
         p_a = np.pad(p_a[shift:], (0, shift), mode='edge')
         p_d = np.pad(p_d[shift:], (0, shift), mode='edge')
 
-    # 2. ASYMETRYCZNE WYGŁADZANIE
+    # 2. Standardowe algorytmiczne wygładzanie sygnałów
     p_h_smooth = _smooth_1d_reflect(p_h, window=37)
     p_a_smooth = _smooth_1d_reflect(p_a, window=37)
-    
-    # Brak wygładzania D (zapobiega wyciekom na H/A) + zbicie o połowę
-    p_d_smooth = p_d.copy() * 0.50 
+    p_d_smooth = _smooth_1d_reflect(p_d, window=7)
 
     probs = np.stack([p_h_smooth, p_a_smooth, p_d_smooth], axis=1)
     probs = np.clip(probs, 0.02, 0.98)
@@ -228,9 +227,9 @@ def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
 
     n = len(df_half)
     
-    # 3. PRZESKALOWANE KARY PRZEJŚĆ (x2.5 dla 25 FPS)
-    pen_ha = 5.2022 * 2.5  # ~13.0055
-    pen_hd = 4.6334 * 2.5  # ~11.5835
+    # 3. Kary przejść wyznaczone bezpośrednio przez Optunę OOF
+    pen_ha = 5.2022
+    pen_hd = 4.6334
     
     log_trans = np.array([
         [0.0, -pen_ha, -pen_hd],
@@ -252,7 +251,7 @@ def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
     for t in range(n - 2, -1, -1):
         states[t] = back[t + 1, states[t + 1]]
 
-    # 4. CZYSZCZENIE (Minimalne spelle)
+    # 4. Standardowe algorytmiczne czyszczenie segmentów
     states_clean = _clean_segments_spell_aware(
         states=states,
         probs=probs,
@@ -261,17 +260,26 @@ def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
         live_sandwich_frames=30,    
     )
     
-    # 5. HISTEREZA KRAWĘDZIOWA (Dociągnięcie granic do uderzenia w piłkę)
-    # Funkcja sama zaimportuje potrzebny moduł na poziomie lokalnym
-    from spells import PossessionSpellExtractor
-    states_snapped = PossessionSpellExtractor.apply_temporal_hysteresis_snapping(
-        decoded_states=states_clean,
-        df_probs=df_half,
-        window_ms=600.0,
-        fps=25.0
-    )
+    return states_clean
     
-    return states_snapped
+def _decode_half_hsmm(df_half: pd.DataFrame, fps: float = DEFAULT_FPS) -> np.ndarray:
+    """
+    Dekoduje połowę meczu za pomocą jawnego dekodera czasowego HSMM (Gamma Duration Modeling).
+    """
+    # Bazowa macierz przejść uwzględniająca zwroty akcji przez martwą piłkę
+    A = np.array([
+        [0.96, 0.01, 0.03],
+        [0.01, 0.96, 0.03],
+        [0.05, 0.05, 0.90]
+    ], dtype=np.float64)
+
+    decoder = HSMMExplicitDurationDecoder(
+        transition_matrix=A,
+        duration_weight=1.2,          # Waga kary za zgodność z rozkładem czasu trwania
+        input_semantics="posterior",  # Dokładna inwersja bayesowska z Roli 4
+        fps=fps
+    )
+    return decoder.decode(df_half)
 
 def _build_spells_dataframe_direct(
     df_source: pd.DataFrame,
