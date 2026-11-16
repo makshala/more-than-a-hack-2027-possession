@@ -33,8 +33,6 @@ Visual perception networks operating on independent video frames are prone to hi
 Raw Frame Predictions:   H H H A H H H D D H H A A A D A A A
                                ^               ^
                          (1-frame flicker)  (False Duel)
-                         
-Tactical Reality:        [--- HOME POSSESSION ---]  [-- AWAY POSSESSION --]
 ```
 
 ### The Five Major Failure Modes of Upstream Models:
@@ -147,11 +145,11 @@ We model state dwell times using continuous **Gamma probability density function
 $$f(d; k, \theta) = \frac{d^{k-1} e^{-\frac{d}{\theta}}}{\theta^k \Gamma(k)}$$
 Where $k$ is the shape parameter, $\theta$ is the scale parameter, and $\Gamma(k)$ is the Gamma function.
 
-In the dynamic programming trellis:
-$$\delta_t(j) = \max_{i \ne j} \max_{d \in [d_{\min}, d_{\max}]} \left\{ \delta_{t-d}(i) + \log A_{ij} + \lambda_d \log f(d; k_j, \theta_j) + \sum_{\tau=t-d+1}^t \log P(X_\tau \mid S_j) \right\}$$
-- When duration $d \to 0$, the log-Gamma penalty $\log f(d) \to -\infty$, creating a smooth mathematical barrier that organically suppresses physically impossible sub-second micro-possessions.
-- As duration approaches typical tactical build-up lengths (10–25 seconds), the penalty reaches its optimum, rewarding sustained, organized play.
-- Emission log-likelihoods over duration $d$ are evaluated in $O(1)$ time using **prefix-summed integral arrays**, keeping inference fast and vectorized.
+When duration $d \to 0$, the log-Gamma penalty $\log f(d) \to -\infty$, creating a smooth mathematical barrier that organically suppresses physically impossible sub-second micro-possessions.
+
+As duration approaches typical tactical build-up lengths (10–25 seconds), the penalty reaches its optimum, rewarding sustained, organized play.
+
+Emission log-likelihoods over duration $d$ are evaluated in $O(1)$ time using **prefix-summed integral arrays**, keeping inference fast and vectorized.
 
 ### 4.5 Calibrated Transition Trellis
 Turnovers in professional football obey strict physical constraints: direct switches between Home and Away rarely occur in a single frame without an intermediate contest, tackle, or loose ball. Our log-transition matrix $A$ applies calibrated penalties:
