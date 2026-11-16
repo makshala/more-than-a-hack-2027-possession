@@ -73,17 +73,14 @@ def _smooth_1d_reflect(arr: np.ndarray, window: int) -> np.ndarray:
 def _clean_segments_spell_aware(
     states: np.ndarray,
     probs: np.ndarray,
-    min_live_frames: int = 32,
+    min_live_frames: int = 25,
     min_dead_frames: int = 25,
-    live_sandwich_frames: int = 38,
+    live_sandwich_frames: int = 55,
 ) -> np.ndarray:
     """
     SpellF1-aware segment post-processor:
-    - NEVER merges H -> D -> H across a valid Dead-Ball stoppage (>= min_dead_frames),
-      because in official scoring D separates two distinct possessions!
-    - Eliminates short H -> A -> H or A -> H -> A live flickers (<= live_sandwich_frames)
-      caused by momentary duels/deflections.
-    - Absorbs micro-segments (< min_live_frames) into the neighbor with higher mean probability.
+    - Protects the 14s mean duration by sweeping out transient (<2.2s) H->A->H flickers.
+    - Prevents false boundary cuts created by momentarily high p_dead that don't form a real stoppage.
     """
     n = len(states)
     if n <= 1:
@@ -106,7 +103,7 @@ def _clean_segments_spell_aware(
 
     segs = _to_rle(states)
 
-    # Pass 1: Remove short Dead-Ball blips (< min_dead_frames) that falsely split a single possession
+    # Pass 1: Prune tiny, unconfirmed D states (< 1.0s) that clip possession lengths.
     changed = True
     while changed:
         changed = False
@@ -114,7 +111,6 @@ def _clean_segments_spell_aware(
             st, s, e = segs[i]
             dur = e - s + 1
             if st == STATE_DEAD_BALL and dur < min_dead_frames and len(segs) > 1:
-                # Reassign to the team (H or A) with higher probability on this slice
                 mean_h = float(np.mean(probs[s : e + 1, STATE_HOME]))
                 mean_a = float(np.mean(probs[s : e + 1, STATE_AWAY]))
                 segs[i][0] = STATE_HOME if mean_h >= mean_a else STATE_AWAY
@@ -123,7 +119,7 @@ def _clean_segments_spell_aware(
         if changed:
             segs = _consolidate(segs)
 
-    # Pass 2: Bridge short LIVE-only sandwiches (H -> A -> H or A -> H -> A), NEVER bridging over valid D!
+    # Pass 2: Aggressive sandwich bridge (H->A->H) up to 2.2s (55 frames) to repair fragmented turnovers.
     changed = True
     while changed:
         changed = False
@@ -145,7 +141,7 @@ def _clean_segments_spell_aware(
         if changed:
             segs = _consolidate(segs)
 
-    # Pass 3: Absorb remaining micro-possessions (< min_live_frames) into highest-probability neighbor
+    # Pass 3: Micro-possession absorption (< 1.0s)
     changed = True
     while changed:
         changed = False
@@ -175,51 +171,67 @@ def _clean_segments_spell_aware(
         out_states[s : e + 1] = st
     return out_states
 
+def _dilate_live_play(states: np.ndarray, expand_frames: int = 12) -> np.ndarray:
+    
+    n = len(states)
+    if n == 0:
+        return states
+
+    diffs = np.flatnonzero(states[1:] != states[:-1]) + 1
+    starts = np.concatenate(([0], diffs))
+    ends = np.concatenate((diffs - 1, [n - 1]))
+    
+    out = states.copy()
+    
+    for s, e in zip(starts, ends):
+        st = states[s]
+        if st in (0, 1):  # H (0) lub A (1)
+            # Ekspansja w lewo (nadpisuje tylko D)
+            for i in range(s - 1, max(-1, s - expand_frames - 1), -1):
+                if out[i] == 2:  # 2 to stan D
+                    out[i] = st
+                else:
+                    break
+                    
+            # Ekspansja w prawo (nadpisuje tylko D)
+            for i in range(e + 1, min(n, e + expand_frames + 1)):
+                if out[i] == 2:
+                    out[i] = st
+                else:
+                    break
+    return out
 
 def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
-    """
-    Decodes a single half for maximum SpellF1 & MacroF1:
-    1. Boosts Role 3 calibrated p_dead near transition boundaries (where Role 3 clamped to 0.35..0.44)
-       so full stoppage durations are captured (fixing D recall from 0.65 -> ~0.82+).
-    2. Applies zero-phase temporal smoothing (35 frames = 1.4s for H/A, 15 frames = 0.6s for D)
-       to eliminate 1-second duel jitter before Viterbi decoding.
-    3. Runs calibrated Log-Viterbi with physically grounded switch costs.
-    """
     p_h = df_half["p_home"].to_numpy(dtype=np.float64)
     p_a = df_half["p_away"].to_numpy(dtype=np.float64)
     dead_col = "p_dead" if "p_dead" in df_half.columns else "p_dead_ball"
     p_d = df_half[dead_col].to_numpy(dtype=np.float64)
 
-    # 1. Recover boundary Dead-Ball frames suppressed by Role 3's [0.01, 0.44] piecewise calibration:
-    # In Role 3, p_d in [0.34, 0.44] right next to a stoppage is true Dead Ball where live play
-    # hasn't stabilized yet (or ball just went out of bounds).
-    d_core = p_d >= 0.48
-    # Dilate confirmed D core by 18 frames (0.72s) on each side to check for elevated boundary p_d
-    d_near_core = np.convolve(d_core.astype(np.int32), np.ones(37, dtype=np.int32), mode="same") > 0
-    d_boosted = np.where(d_near_core & (p_d >= 0.28), np.maximum(p_d * 1.45, 0.54), p_d)
-    # Also boost anywhere p_dead is already the highest of the 3 probabilities
-    is_d_modal = (p_d >= p_h) & (p_d >= p_a) & (p_d >= 0.36)
-    d_boosted = np.where(is_d_modal, np.maximum(d_boosted, 0.53), d_boosted)
+    # 1. TIME-SHIFTING (Kompensacja opóźnienia)
+    shift = 3
+    if shift > 0:
+        p_h = np.pad(p_h[shift:], (0, shift), mode='edge')
+        p_a = np.pad(p_a[shift:], (0, shift), mode='edge')
+        p_d = np.pad(p_d[shift:], (0, shift), mode='edge')
 
-    # 2. Zero-phase multi-scale smoothing:
-    # Smooth H and A over 35 frames (1.4s) to match coach-level spell granularity,
-    # while keeping D sharp (11 frames = 0.44s) for low transition latency.
-    p_h_smooth = _smooth_1d_reflect(p_h, window=15)
-    p_a_smooth = _smooth_1d_reflect(p_a, window=15)
-    p_d_smooth = _smooth_1d_reflect(d_boosted, window=11)
+    # 2. ASYMETRYCZNE WYGŁADZANIE
+    p_h_smooth = _smooth_1d_reflect(p_h, window=37)
+    p_a_smooth = _smooth_1d_reflect(p_a, window=37)
+    
+    # Brak wygładzania D (zapobiega wyciekom na H/A) + zbicie o połowę
+    p_d_smooth = p_d.copy() * 0.50 
 
     probs = np.stack([p_h_smooth, p_a_smooth, p_d_smooth], axis=1)
-    # Soft floor at 0.02 prevents a single outlier frame from generating -13.8 log-likelihood spikes
     probs = np.clip(probs, 0.02, 0.98)
     probs /= np.sum(probs, axis=1, keepdims=True)
     log_emit = np.log(probs)
 
     n = len(df_half)
-    # Calibrated transition penalties in bounded log space (max per-frame log-ratio is ~3.8):
-    # Direct H <-> A switch requires ~4.5 frames (0.18s) of decisive smoothed dominance;
-    # H/A <-> D switch requires ~3.2 frames so stoppages snap with near-zero latency.
-    pen_ha = 8.0
-    pen_hd = 6.0
+    
+    # 3. PRZESKALOWANE KARY PRZEJŚĆ (x2.5 dla 25 FPS)
+    pen_ha = 5.2022 * 2.5  # ~13.0055
+    pen_hd = 4.6334 * 2.5  # ~11.5835
+    
     log_trans = np.array([
         [0.0, -pen_ha, -pen_hd],
         [-pen_ha, 0.0, -pen_hd],
@@ -240,16 +252,26 @@ def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
     for t in range(n - 2, -1, -1):
         states[t] = back[t + 1, states[t + 1]]
 
-    # 3. SpellF1-aware cleanup (never merges H -> D -> H across real stoppages!)
+    # 4. CZYSZCZENIE (Minimalne spelle)
     states_clean = _clean_segments_spell_aware(
         states=states,
         probs=probs,
-        min_live_frames=18,         # 1.28s minimum standalone possession
-        min_dead_frames=20,         # 1.00s minimum stoppage
-        live_sandwich_frames=18,    # 1.52s max live-duel flicker (H -> A -> H)
+        min_live_frames=30,         
+        min_dead_frames=25,         
+        live_sandwich_frames=30,    
     )
-    return states_clean
-
+    
+    # 5. HISTEREZA KRAWĘDZIOWA (Dociągnięcie granic do uderzenia w piłkę)
+    # Funkcja sama zaimportuje potrzebny moduł na poziomie lokalnym
+    from spells import PossessionSpellExtractor
+    states_snapped = PossessionSpellExtractor.apply_temporal_hysteresis_snapping(
+        decoded_states=states_clean,
+        df_probs=df_half,
+        window_ms=600.0,
+        fps=25.0
+    )
+    
+    return states_snapped
 
 def _build_spells_dataframe_direct(
     df_source: pd.DataFrame,

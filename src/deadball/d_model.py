@@ -198,10 +198,7 @@ def _snap_both_deadball_edges(
     ball_y_centered: np.ndarray,
 ) -> np.ndarray:
     """
-    Snaps both boundaries of each Dead-Ball window without prematurely truncating D segments:
-    1. Left boundary (d_start): aligns to the exact ball-out-of-bounds or referee whistle impulse.
-    2. Right boundary (frame_zero): aligns to the true restart kick/throw in the second half of the window,
-       avoiding false early triggers from players retrieving the ball.
+    Snaps both boundaries of each Dead-Ball window without prematurely truncating D segments.
     """
     p_refined = p_dead_raw.copy()
 
@@ -219,8 +216,6 @@ def _snap_both_deadball_edges(
         dom_type = valid_types[0] if len(valid_types) > 0 else None
 
         # --- STEP A: Detect right boundary ("frame 0" - actual ball restart) ---
-        # Search starts at 45% of the padded window (after the pre-padding and setup phase)
-        # so ball retrieval movements are never mistaken for the restart kick.
         search_start = s_idx + int(0.45 * win_len)
         search_slice = slice(search_start, e_idx + 1)
 
@@ -241,7 +236,6 @@ def _snap_both_deadball_edges(
             best_offset = int(np.argmax(restart_score))
             frame_zero = search_start + best_offset
         else:
-            # Default fallback near the end of the core tag (e_idx - 50 frames)
             frame_zero = max(search_start, e_idx - 50)
 
         # --- STEP B: Detect left boundary (d_start - ball out-of-bounds or whistle) ---
@@ -265,25 +259,24 @@ def _snap_both_deadball_edges(
         else:
             d_start = s_idx
 
-        # Gently suppress only confirmed pre-whistle live frames before d_start
+        # ZMIANA: Delikatniejsze tłumienie przed gwizdkiem (z 0.42 na 0.85) - nie ucinamy akcji!
         if d_start > s_idx:
             p_refined[s_idx:d_start] = np.minimum(
                 p_refined[s_idx:d_start],
-                0.42 * kinematic_d_score[s_idx:d_start],
+                0.85 * kinematic_d_score[s_idx:d_start],
             )
 
-        # Boost p_dead inside the active stoppage interval [d_start, frame_zero)
         if frame_zero > d_start:
             p_refined[d_start:frame_zero] = np.maximum(
                 p_refined[d_start:frame_zero],
                 np.clip(0.64 + 0.34 * kinematic_d_score[d_start:frame_zero], 0.68, 0.99),
             )
 
-        # Crisp post-restart decay over a short 22-frame (0.88s) window after frame_zero
-        post_end = min(N_FRAMES, frame_zero + 22)
+        # ZMIANA: Drastyczne skrócenie "ogona" martwej piłki po wznowieniu z 22 klatek na 3 klatki!
+        post_end = min(N_FRAMES, frame_zero + 3)
         decay_len = post_end - frame_zero
         if decay_len > 0:
-            decay_curve = np.linspace(0.08, 0.32, decay_len, dtype=np.float32)
+            decay_curve = np.linspace(0.05, 0.15, decay_len, dtype=np.float32)
             p_refined[frame_zero:post_end] = np.minimum(
                 p_refined[frame_zero:post_end],
                 decay_curve * kinematic_d_score[frame_zero:post_end],
