@@ -204,16 +204,16 @@ CONFIG: dict[str, Any] = {
         "enabled": True,
         "method": "bounded_log_odds_evidence",
         "model_logit_temperature": 1.85,
-        "max_total_adjustment_log_odds": 2.40,
+        "max_total_adjustment_log_odds": 1.80,
         "probability_epsilon": 1e-6,
         "uncertainty_gating": False,
         "group_caps_log_odds": {
             "direct_ball_contact": 1.45,
             "possession_history": 0.75,
             "smart_tagging": 0.40,
-            "leadlag": 0.35,
+            "leadlag": 0.05,
         },
-        "rules": (
+           "rules": (
             {
                 "name": "direct_near1_distance_advantage",
                 "column": "near1_dist_diff_m",
@@ -226,7 +226,7 @@ CONFIG: dict[str, Any] = {
                     {
                         "kind": "category_map",
                         "column": "ball_status_code",
-                        "mapping": {0: 1.0, 1: 0.85, 2: 0.40},
+                        "mapping": {0: 1.0, 1: 0.95, 2: 0.90}, 
                     },
                 ),
                 "sign_semantics": "away_near1_dist_m - home_near1_dist_m; positive means Home player is closer to the ball",
@@ -244,7 +244,7 @@ CONFIG: dict[str, Any] = {
                     {
                         "kind": "category_map",
                         "column": "ball_status_code",
-                        "mapping": {0: 1.0, 1: 0.85, 2: 0.40},
+                        "mapping": {0: 1.0, 1: 0.95, 2: 0.90}, 
                     },
                 ),
                 "sign_semantics": "home_in_3m - away_in_3m; overrides formation bias during short 2-3s turnovers",
@@ -313,30 +313,7 @@ CONFIG: dict[str, Any] = {
                 ),
                 "sign_semantics": "Positive tag-vote difference favors Home",
             },
-            {
-                "name": "near1_distance_leadlag_04s",
-                "column": "near1_diff_leadlag_10f",
-                "kind": "signed_scaled",
-                "scale": 1.8,
-                "group": "leadlag",
-                "weight_log_odds": 0.20,
-                "quality_gates": (
-                    {"kind": "binary", "column": "is_graded", "on_value": 1},
-                ),
-                "sign_semantics": "Lead-lag distance change at turnover boundaries",
-            },
-            {
-                "name": "pitch_control_leadlag_04s",
-                "column": "pitch_ctrl_leadlag_10f",
-                "kind": "signed_scaled",
-                "scale": 0.22,
-                "group": "leadlag",
-                "weight_log_odds": 0.15,
-                "quality_gates": (
-                    {"kind": "binary", "column": "is_graded", "on_value": 1},
-                ),
-                "sign_semantics": "Lead-lag pitch control shift",
-            },
+           
         ),
         "context_only_columns": (
             "st_set_piece",
