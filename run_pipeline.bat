@@ -2,7 +2,6 @@
 setlocal enabledelayedexpansion
 
 set "TEAM_NAME=IAD AGH"
-:: Gwarantuje widoczność modułów z głównego katalogu oraz podkatalogów
 set "PYTHONPATH=%cd%;%cd%\evaluation;%cd%\src"
 
 echo --- [1/6] Running Camera Synchronization ---

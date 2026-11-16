@@ -20,30 +20,19 @@ except ImportError:
 
 
 def resolve_match_paths():
+    # Pobiera absolutną ścieżkę do głównego katalogu repozytorium (omija podfoldery src itp.)
     base_dir = os.environ.get("MTAH_DATA_DIR", os.path.join(ROOT, "data"))
     tac_dir = os.path.join(base_dir, "tactical")
 
-    if games is not None and hasattr(games, "asset_paths"):
-        t_paths = games.asset_paths(game=GAME)
-        meta_path = t_paths["atd_meta"]
-        raw_path = t_paths["atd_raw"]
-        st_path = t_paths.get("smart_tagging", os.path.join(tac_dir, f"{GAME}_tactical_smart_tagging.xml"))
-        homo_path = t_paths.get("homography", os.path.join(tac_dir, f"{GAME}_tactical_homography.csv"))
-    else:
-        meta_path = os.path.join(tac_dir, f"{GAME}_tactical_atd.xml")
-        raw_path = os.path.join(tac_dir, f"{GAME}_tactical_atd.txt")
-        st_path = os.path.join(tac_dir, f"{GAME}_tactical_smart_tagging.xml")
-        homo_path = os.path.join(tac_dir, f"{GAME}_tactical_homography.csv")
+    meta_path = os.path.join(tac_dir, "BAR-ATH_tactical_atd.xml")
+    raw_path = os.path.join(tac_dir, "BAR-ATH_tactical_atd.txt")
+    st_path = os.path.join(tac_dir, "BAR-ATH_tactical_smart_tagging.xml")
+    homo_path = os.path.join(tac_dir, "BAR-ATH_tactical_homography.csv")
 
-    if games is not None and hasattr(games, "half_video_blocks"):
-        blocks = games.half_video_blocks(GAME)
-        (_, h1_s, h1_e), (_, h2_s, h2_e) = blocks[0], blocks[1]
-    else:
-        h1_s, h1_e, h2_s, h2_e = H1_START, H1_END, H2_START, H2_END
+    h1_s, h1_e, h2_s, h2_e = H1_START, H1_END, H2_START, H2_END
+    n_frames = 199319 
 
-    n_frames = int(games.source_frames("tactical", GAME)) if games is not None and hasattr(games, "source_frames") else 199319
     return meta_path, raw_path, st_path, homo_path, n_frames, (h1_s, h1_e, h2_s, h2_e)
-
 
 def get_slot_teams(meta_path):
     root = ET.parse(meta_path).getroot()
