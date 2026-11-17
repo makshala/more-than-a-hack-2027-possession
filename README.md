@@ -53,7 +53,7 @@ Our engineering workflow is divided into **5 specialized roles**, each responsib
 2. **Role 2 (Spatio-Temporal Feature Engineering — `src/tracking/`):** Computes 111 physical, spatial, and tactical features (`build_stage1.py`), including ball kinematics, player-to-ball distances, pitch control, goalkeeper context, and possession control windows.
 3. **Role 3 (Dead-Ball Engine — `src/deadball/`):** Fuses SportsCode XML set-piece priors with pitch boundary geometry, FIFA exclusion-zone rules, and restart kick impulses inside a 2-state Viterbi decoder to output calibrated out-of-play probabilities `P(D)`.
 4. **Role 4 (Live Possession ML & Evidence Fusion — `src/possession/`):** Predicts conditional live-play probabilities `P(H|live)` and `P(A|live)` using a `HistGradientBoostingClassifier` trained on 37 shared features from external SkillCorner Open Data, then refines predictions via bounded log-odds evidence rules (with noisy `leadlag` votes disabled) before fusing with Role 3's `P(D)`.
-5. **Role 5 (Temporal Spell Decoder — `src/decode/`):** Decodes the 3-state probability simplex into contiguous possession spells using cross-FPS phase-shift compensation (`10 FPS -> 25 FPS`, `shift = 3 frames`), asymmetric smoothing (`window = 37` on `H/A` live play alongside a sharp `D` profile), calibrated log-Viterbi transition penalties, and spell-aware sandwich filtering.
+5. **Role 5 (Temporal Spell Decoder — `src/decode/`):** Decodes the 3-state probability simplex into contiguous possession spells using cross-FPS phase-shift compensation (`10 FPS -> 25 FPS`, `shift = 3 frames`), asymmetric smoothing, calibrated log-Viterbi transition penalties, and spell-aware sandwich filtering.
 
 ---
 
