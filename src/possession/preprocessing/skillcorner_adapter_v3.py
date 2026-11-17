@@ -1,11 +1,12 @@
+
 #!/usr/bin/env python3
 """Convert SkillCorner Open Data into a frame-level H/A training table.
 
 VERSION 3
 ---------
-Phases of Play is the dominant target source and overwrites labels from all
-other sources. Tracking ``possession.group`` provides the initial labels;
-Dynamic Events fills only frames that are still unlabelled.
+Tracking ``possession.group`` and Dynamic Events provide the primary labels.
+Phases of Play acts as a fallback source and fills only frames that are 
+still unlabelled, preserving short-term actual possessions.
 """
 
 from __future__ import annotations
@@ -33,9 +34,9 @@ SKILLCORNER_DT = 1.0 / SKILLCORNER_FPS
 PITCH_LENGTH_M = 105.3
 PITCH_WIDTH_M = 68.0
 
-REACTION_TIME_S = 0.40
+REACTION_TIME_S = 0.25
 PLAYER_MAX_SPEED_MS = 7.50
-PITCH_CONTROL_TAU_S = 0.50
+PITCH_CONTROL_TAU_S = 0.30
 
 CONTESTED_RADIUS_M = 2.5
 CONTROL_RADIUS_3M = 3.0
@@ -43,7 +44,7 @@ SUPPORT_RADIUS_5M = 5.0
 
 SAVGOL_WINDOW = 7
 SAVGOL_POLY = 2
-BALL_SAVGOL_WINDOW = 5
+BALL_SAVGOL_WINDOW = 4
 BALL_SAVGOL_POLY = 2
 
 PLAYER_MAX_KINEMATIC_SPEED_MS = 12.5
@@ -1075,8 +1076,8 @@ def _apply_interval_labels(
 ) -> dict[str, Any]:
     """Apply interval labels and collect source-specific diagnostics.
 
-    When ``overwrite`` is True (Phases of Play), labels replace existing labels
-    in every covered frame. When it is False (Dynamic Events), only currently
+    When ``overwrite`` is True, labels replace existing labels in every covered 
+    frame. When it is False (Dynamic Events, Phases of Play), only currently
     unlabelled frames are filled. Diagnostic counters do not affect labels.
     """
     stats: dict[str, Any] = {
@@ -1381,7 +1382,7 @@ def convert_match(match_dir: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
         )
     )
 
-    # 3. Phases of Play: dominant source; overwrite existing labels (code 3).
+    # 3. Phases of Play: fallback source; fill only unlabelled frames (code 3).
     fallback_stats.update(
         _apply_interval_labels(
             match_dir / f"{match_id}_phases_of_play.csv",
@@ -1393,7 +1394,7 @@ def convert_match(match_dir: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
             team_column="team_in_possession_id",
             source_name="phases",
             event_type_filter=None,
-            overwrite=True,
+            overwrite=False,
             end_exclusive=True,
         )
     )
