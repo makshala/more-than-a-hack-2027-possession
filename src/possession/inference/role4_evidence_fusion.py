@@ -273,7 +273,7 @@ def apply_directional_evidence(
 
     # Scale HGB macro-phase logits by temperature so physical ball-contact evidence
     # can flip possession during 2-4 second turnovers and counter-attacks
-    model_temp = float(evidence_config.get("model_logit_temperature", 1.85))
+    model_temp = float(evidence_config.get("model_logit_temperature", 2.2))
     hgb_logit = logit(np.clip(p_home, epsilon, 1.0 - epsilon)) / max(model_temp, 1.0)
     adjusted = expit(hgb_logit + delta)
     away = 1.0 - adjusted
@@ -331,13 +331,14 @@ def fuse_three_state_probabilities(
         raise ValueError("H/A/D probability arrays must have equal lengths.")
 
     # Preserve calibrated Role 3 Dead-Ball boundary probabilities
+    # Preserve calibrated Role 3 Dead-Ball boundary probabilities
     pd_calibrated = np.where(
         pd_ >= 0.50,
-        np.clip(0.65 + 0.34 * pd_, 0.65, 0.995),
+        np.clip(0.55 + 0.44 * pd_, 0.55, 0.995),
         np.where(
-            pd_ >= 0.24,
-            np.clip(0.38 + (pd_ - 0.24) * 1.15, 0.38, 0.64),
-            pd_ * 0.75,
+            pd_ >= 0.32,
+            np.clip(0.32 + (pd_ - 0.32) * 1.25, 0.32, 0.545),
+            pd_ * 0.65,
         ),
     )
 

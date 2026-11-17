@@ -210,7 +210,7 @@ CONFIG: dict[str, Any] = {
         "group_caps_log_odds": {
             "direct_ball_contact": 1.45,
             "possession_history": 0.75,
-            "smart_tagging": 0.40,
+            "smart_tagging": 0.60,
             "leadlag": 0.05,
         },
            "rules": (
@@ -223,10 +223,11 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.90,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
+                    {"kind": "exp_decay", "column": "homography_reproj_err", "scale": 3.5},
                     {
                         "kind": "category_map",
                         "column": "ball_status_code",
-                        "mapping": {0: 1.0, 1: 0.95, 2: 0.90}, 
+                        "mapping": {0: 1.0, 1: 0.95, 2: 0.90},
                     },
                 ),
                 "sign_semantics": "away_near1_dist_m - home_near1_dist_m; positive means Home player is closer to the ball",
@@ -241,10 +242,11 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.65,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
+                    {"kind": "exp_decay", "column": "homography_reproj_err", "scale": 3.5},
                     {
                         "kind": "category_map",
                         "column": "ball_status_code",
-                        "mapping": {0: 1.0, 1: 0.95, 2: 0.90}, 
+                        "mapping": {0: 1.0, 1: 0.95, 2: 0.90},
                     },
                 ),
                 "sign_semantics": "home_in_3m - away_in_3m; overrides formation bias during short 2-3s turnovers",
@@ -258,6 +260,7 @@ CONFIG: dict[str, Any] = {
                 "weight_log_odds": 0.40,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
+                    {"kind": "exp_decay", "column": "homography_reproj_err", "scale": 3.5},
                 ),
                 "sign_semantics": "away_min_tti_s - home_min_tti_s; positive means Home reaches ball faster",
             },
@@ -295,7 +298,7 @@ CONFIG: dict[str, Any] = {
                 "away_values": (-1, "-1", "AWAY", "A"),
                 "neutral_values": (0, "0", "UNKNOWN", "NONE", "NAN", "NULL", None),
                 "unknown_value_policy": "error",
-                "weight_log_odds": 0.30,
+                "weight_log_odds": 0.80,
                 "quality_gates": (
                     {"kind": "binary", "column": "is_graded", "on_value": 1},
                 ),
@@ -313,7 +316,31 @@ CONFIG: dict[str, Any] = {
                 ),
                 "sign_semantics": "Positive tag-vote difference favors Home",
             },
-           
+            {
+                "name": "contested_pressure_cut",
+                "kind": "paired_count_difference",
+                "home_column": "home_in_3m",
+                "away_column": "away_in_3m",
+                "scale": 1.0,
+                "weight_log_odds": 1.50,
+                "group": "physical_duels",
+                "quality_gates": (
+                    {"kind": "binary", "column": "is_contested", "on_value": 1.0},
+                    {"kind": "exp_decay", "column": "homography_reproj_err", "scale": 3.5},
+                ),
+            },
+            {
+                "name": "dynamic_interception",
+                "kind": "signed_scaled",
+                "column": "tti_diff_s",
+                "scale": 1.0,
+                "weight_log_odds": 1.80,
+                "group": "interceptions",
+                "quality_gates": (
+                    {"kind": "min_ratio", "column": "ball_speed", "scale": 8.0},
+                    {"kind": "exp_decay", "column": "homography_reproj_err", "scale": 3.5},
+                ),
+            },
         ),
         "context_only_columns": (
             "st_set_piece",

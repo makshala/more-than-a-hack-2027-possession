@@ -14,12 +14,12 @@ import time
 import argparse
 import numpy as np
 import pandas as pd
-from hsmm_decoder import HSMMExplicitDurationDecoder
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+from hsmm_decoder import HSMMExplicitDurationDecoder
 from config import (
     DEFAULT_FPS, STATE_HOME, STATE_AWAY, STATE_DEAD_BALL, STATE_MAP,
     DEFAULT_PARQUET_PATH, DEFAULT_SYNC_PATH,
@@ -208,17 +208,18 @@ def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
     dead_col = "p_dead" if "p_dead" in df_half.columns else "p_dead_ball"
     p_d = df_half[dead_col].to_numpy(dtype=np.float64)
 
-    # 1. Algorytmiczny Time-Shifting (skalowanie 10 -> 25 FPS)
-    shift = 3
+    # 1. Algorytmiczny Time-Shifting (skalowanie 10 -> 25 FPS + kompensacja opóźnienia fazowego):
+    # Koryguje przesunięcie wynikające z różnicy częstotliwości próbkowania oraz bezwładności filtrów czasowych.
+    shift = 20
     if shift > 0:
         p_h = np.pad(p_h[shift:], (0, shift), mode='edge')
         p_a = np.pad(p_a[shift:], (0, shift), mode='edge')
         p_d = np.pad(p_d[shift:], (0, shift), mode='edge')
 
     # 2. Standardowe algorytmiczne wygładzanie sygnałów
-    p_h_smooth = _smooth_1d_reflect(p_h, window=37)
-    p_a_smooth = _smooth_1d_reflect(p_a, window=37)
-    p_d_smooth = _smooth_1d_reflect(p_d, window=7)
+    p_h_smooth = _smooth_1d_reflect(p_h, window=5)
+    p_a_smooth = _smooth_1d_reflect(p_a, window=5)
+    p_d_smooth = _smooth_1d_reflect(p_d, window=4)
 
     probs = np.stack([p_h_smooth, p_a_smooth, p_d_smooth], axis=1)
     probs = np.clip(probs, 0.02, 0.98)
@@ -227,9 +228,10 @@ def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
 
     n = len(df_half)
     
-    # 3. Kary przejść wyznaczone bezpośrednio przez Optunę OOF
-    pen_ha = 5.2022
-    pen_hd = 4.6334
+    # 3. Kary przejść baselinowo wyliczone przez Optunę, potem dostosowywane do wynikow na
+    # syntetycznym GT
+    pen_ha = 1.6
+    pen_hd = 2.5
     
     log_trans = np.array([
         [0.0, -pen_ha, -pen_hd],
@@ -255,10 +257,12 @@ def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
     states_clean = _clean_segments_spell_aware(
         states=states,
         probs=probs,
-        min_live_frames=30,         
-        min_dead_frames=25,         
-        live_sandwich_frames=30,    
+        min_live_frames=18,         
+        min_dead_frames=30,         
+        live_sandwich_frames=28,    
     )
+
+    states_clean = _dilate_live_play(states_clean, expand_frames=8)
     
     return states_clean
     

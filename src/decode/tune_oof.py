@@ -1,33 +1,49 @@
+import importlib.util
+import warnings
 import numpy as np
 import pandas as pd
 import optuna
-import warnings
+import os
+import sys
 
 # Ignorowanie ostrzeżeń ze względu na czystość wyjścia
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+INFERENCE_DIR = os.path.abspath(os.path.join(HERE, "..", "possession", "inference"))
+
+for path in (HERE, INFERENCE_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
 from main import _smooth_1d_reflect, _clean_segments_spell_aware
+from role4_evidence_fusion import apply_directional_evidence
 
 def count_spells(states_array):
-    if len(states_array) == 0: return 0
+    if len(states_array) == 0:
+        return 0
     return int(np.sum(states_array[1:] != states_array[:-1]) + 1)
 
-def objective(trial, df, p_home_col, p_away_col, p_dead_col):
+def objective(trial, df, p_home_col, p_away_col, p_dead_col, train_mids, val_mids):
     # Szukamy hiperparametrów dla skali SkillCornera (10 FPS)
-    shift = trial.suggest_int('shift', 0, 5) # Opóźnienie 0 do 0.5s
-    win_ha = trial.suggest_int('win_ha', 5, 19, step=2) 
-    win_d = trial.suggest_int('win_d', 3, 9, step=2)
-    pen_ha = trial.suggest_float('pen_ha', 5.0, 15.0)
-    pen_hd = trial.suggest_float('pen_hd', 4.0, 12.0)
-    min_live = trial.suggest_int('min_live', 12, 25)
+    shift = trial.suggest_int('shift', 0, 5)  # Opóźnienie 0 do 0.5s
+    win_ha = trial.suggest_int('win_ha', 5, 11, step=2)
+    win_d = trial.suggest_int('win_d', 4, 7, step=2)  # Poprawiona nazwa parametru!
+    pen_ha = trial.suggest_float('pen_ha', 3.0, 8.0)
+    pen_hd = trial.suggest_float('pen_hd', 3.0, 8.0)
+    min_live = trial.suggest_int('min_live', 7, 16)
     
-    match_ids = df['match_id'].unique()
-    scores = []
+    train_scores = []
+    val_scores = []
     
-    # Trenujemy na 5 pierwszych meczach OOF dla szybkości eksperymentu
-    for mid in match_ids[:5]:
-        df_match = df[df['match_id'] == mid].sort_values('frame').copy()
+    all_current_mids = list(train_mids) + list(val_mids)
+    
+    for mid in all_current_mids:
+        df_match = df[df['match_id'].astype(str) == str(mid)].sort_values('frame').copy()
+        
+        if len(df_match) == 0:
+            continue
         
         p_h = df_match[p_home_col].to_numpy(dtype=np.float64)
         p_a = df_match[p_away_col].to_numpy(dtype=np.float64)
@@ -35,7 +51,6 @@ def objective(trial, df, p_home_col, p_away_col, p_dead_col):
         gt_states = df_match['target'].to_numpy(dtype=np.int32)
         
         # --- NAUKOWY TIME-SHIFTING NA PRAWDOPODOBIEŃSTWACH ---
-        # Cofamy wejściowe odczyty w czasie, aby zrekompensować opóźnienie modelu
         if shift > 0:
             p_h = np.pad(p_h[shift:], (0, shift), mode='edge')
             p_a = np.pad(p_a[shift:], (0, shift), mode='edge')
@@ -84,7 +99,7 @@ def objective(trial, df, p_home_col, p_away_col, p_dead_col):
         states_clean = _clean_segments_spell_aware(
             states=states, probs=probs,
             min_live_frames=min_live,
-            min_dead_frames=min_live-2,
+            min_dead_frames=max(1, min_live - 2),
             live_sandwich_frames=min_live,
         )
         
@@ -93,29 +108,124 @@ def objective(trial, df, p_home_col, p_away_col, p_dead_col):
         pred_spells = count_spells(states_clean)
         frag = pred_spells / max(1, gt_spells)
         
-        # Bardzo rygorystyczna kara za fragmentację (surowsza niż wcześniej)
-        frag_penalty = 1.5 * abs(frag - 1.0)
-        scores.append(macro_f1 - frag_penalty)
+        # POLUZOWANA kara za fragmentację 
+        frag_penalty = 0.2 * abs(frag - 1.0)
+        final_score = macro_f1 - frag_penalty
         
-    return np.mean(scores)
+        if str(mid) in train_mids:
+            train_scores.append(final_score)
+        else:
+            val_scores.append(final_score)
+            
+    mean_train = np.mean(train_scores) if train_scores else 0
+    mean_val = np.mean(val_scores) if val_scores else 0
+    
+    trial.set_user_attr("train_score", float(mean_train))
+    trial.set_user_attr("val_score", float(mean_val))
+    
+    return mean_val
 
 if __name__ == "__main__":
-    print("Inicjalizacja naukowej optymalizacji z wbudowanym Phase Shiftem (OOF)...")
-    df = pd.read_csv("role4_artifacts/role4_oof_predictions.csv")
+    print("Inicjalizacja naukowej optymalizacji z chronionym testem i Evidence Fusion (OOF)...")
     
-    # Detekcja kolumn
-    p_home_col = next(c for c in df.columns if 'p_home' in c.lower())
-    p_away_col = next(c for c in df.columns if 'p_away' in c.lower())
-    prob_cols = [c for c in df.columns if 'p_' in c.lower() or 'regres' in c.lower()]
-    p_dead_col = [c for c in prob_cols if c not in (p_home_col, p_away_col)][0]
+    # --- 1. WCZYTANIE KONFIGURACJI Z NOWYMI REGUŁAMI ---
+    config_path = os.path.abspath(os.path.join(HERE, "..", "possession", "config.py"))
+    spec = importlib.util.spec_from_file_location("cfg", config_path)
+    cfg_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cfg_mod)
+    evidence_cfg = cfg_mod.get_config()["role4_evidence_fusion"]
+
+    # --- 2. WCZYTANIE SUROWEGO OOF I CECH FIZYCZNYCH ---
+    df_oof = pd.read_csv("role4_artifacts/role4_oof_predictions.csv")
+    
+    # PODAJ TUTAJ WŁAŚCIWĄ ŚCIEŻKĘ DO PARQUETA Z CECHAMI 20 MECZÓW:
+    df_features = pd.read_parquet("src/possession/training/skillcorner_training.parquet") 
+
+    df_oof["match_id"] = df_oof["match_id"].astype(str)
+    df_features["match_id"] = df_features["match_id"].astype(str)
+
+    # Dołączamy tylko cechy wymagane do nowych reguł Evidence Fusion
+    # Bierzemy z df_features wszystkie kolumny, których nie ma jeszcze w df_oof (plus klucze do złączenia)
+    extra_cols = ["match_id", "frame"] + [c for c in df_features.columns if c not in df_oof.columns]
+
+    df = pd.merge(
+        df_oof,
+        df_features[extra_cols],
+        on=["match_id", "frame"],
+        how="inner",
+        validate="one_to_one"
+    )
+
+    # Zabezpieczenie na wypadek, gdyby Parquet ze SkillCorner nie miał kolumny 'is_graded'
+    if "is_graded" not in df.columns:
+        df["is_graded"] = 1
+
+    # --- 3. FILTROWANIE REGUŁ I APLIKACJA EVIDENCE FUSION ---
+    valid_rules = []
+    for rule in evidence_cfg.get("rules", []):
+        if not rule.get("active", True):
+            continue
+        req_cols = [rule.get("column"), rule.get("home_column"), rule.get("away_column")]
+        for gate in rule.get("quality_gates", []):
+            req_cols.extend([gate.get("column"), gate.get("home_column"), gate.get("away_column")])
+        req_cols = [c for c in req_cols if c]
+        
+        if all(c in df.columns for c in req_cols):
+            valid_rules.append(rule)
+        else:
+            missing = [c for c in req_cols if c not in df.columns]
+            print(f"[INFO] Pomijam regułę '{rule.get('name')}' w OOF (brak kolumn w SkillCorner: {missing})")
+
+    oof_evidence_cfg = dict(evidence_cfg)
+    oof_evidence_cfg["rules"] = valid_rules
+
+    # --- 4. APLIKACJA NOWYCH REGUŁ EVIDENCE FUSION NA SUROWE HGB ---
+    p_home_adj, p_away_adj, _, _ = apply_directional_evidence(
+        df=df,
+        p_home_model=df["hist_gradient_boosting_p_home"],
+        evidence_config=oof_evidence_cfg,
+        model_feature_names=[]
+    )
+
+    df["p_home_fused"] = p_home_adj
+    df["p_away_fused"] = p_away_adj
+    
+    # Tworzymy bezpieczną kolumnę p_dead dla OOF (zakładamy 0.0 dla klatek Live lub 1.0 jeśli target==2)
+    df["p_dead_oof"] = np.where(df["target"] == 2, 0.99, 0.01)
+
+    p_home_col = "p_home_fused"
+    p_away_col = "p_away_fused"
+    p_dead_col = "p_dead_oof"
+
+    # --- 4. WYKLUCZENIE MECZU TESTOWEGO I PODZIAŁ NA TRAIN/VAL ---
+    TEST_MATCHES = ["1874553"]
+    all_matches = sorted(df["match_id"].astype(str).unique())
+    available_train_matches = [m for m in all_matches if m not in TEST_MATCHES]
+
+    rng = np.random.default_rng(seed=42)
+    train_mids = rng.choice(available_train_matches, size=15, replace=False)
+    val_mids = [m for m in all_matches if m not in train_mids]
+    
+    all_needed_mids = list(train_mids) + list(val_mids)
+    df = df[df['match_id'].astype(str).isin(all_needed_mids)].copy()
+
+    print(f"Trening parametrów na: {len(train_mids)} meczach.")
+    print(f"Weryfikacja parametrów (Val) na: {len(val_mids)} meczach (w tym chroniony: {TEST_MATCHES}).")
 
     study = optuna.create_study(direction='maximize')
-    study.optimize(lambda t: objective(t, df, p_home_col, p_away_col, p_dead_col), n_trials=75, show_progress_bar=True)
+    study.optimize(
+        lambda t: objective(t, df, p_home_col, p_away_col, p_dead_col, train_mids, val_mids),
+        n_trials=75,
+        show_progress_bar=True
+    )
     
     print("\n" + "="*50)
     print("OPTYMALNE PARAMETRY DLA OOF (SKALA 10 FPS):")
     best = study.best_params
     for k, v in best.items(): 
         print(f"  {k}: {v}")
+        
+    print(f"\n[BEST TRIAL] Train Score (15 meczów): {study.best_trial.user_attrs.get('train_score'):.4f}")
+    print(f"[BEST TRIAL] Val Score (weryfikacja):   {study.best_trial.user_attrs.get('val_score'):.4f}")
     print("="*50)
     print("Proszę, wklej mi powyższe wyniki. Wykonam wtedy bezpieczną przesiadkę do main.py.")
