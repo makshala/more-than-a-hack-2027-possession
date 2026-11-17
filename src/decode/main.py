@@ -208,8 +208,9 @@ def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
     dead_col = "p_dead" if "p_dead" in df_half.columns else "p_dead_ball"
     p_d = df_half[dead_col].to_numpy(dtype=np.float64)
 
-    # 1. Algorytmiczny Time-Shifting (skalowanie 10 -> 25 FPS)
-    shift = 17
+    # 1. Algorytmiczny Time-Shifting (skalowanie 10 -> 25 FPS + kompensacja opóźnienia fazowego):
+    # Koryguje przesunięcie wynikające z różnicy częstotliwości próbkowania oraz bezwładności filtrów czasowych.
+    shift = 20
     if shift > 0:
         p_h = np.pad(p_h[shift:], (0, shift), mode='edge')
         p_a = np.pad(p_a[shift:], (0, shift), mode='edge')
@@ -257,11 +258,11 @@ def _decode_half_spell_optimal(df_half: pd.DataFrame) -> np.ndarray:
         states=states,
         probs=probs,
         min_live_frames=18,         
-        min_dead_frames=25,         
-        live_sandwich_frames=27,    
+        min_dead_frames=30,         
+        live_sandwich_frames=28,    
     )
 
-    states_clean = _dilate_live_play(states_clean, expand_frames=5)
+    states_clean = _dilate_live_play(states_clean, expand_frames=8)
     
     return states_clean
     
