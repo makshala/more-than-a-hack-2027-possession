@@ -130,7 +130,7 @@ def build_stage0_video():
     n_tac = SOURCES["tactical"]["n_video_frames"]    # 199,319
     n_brd = SOURCES["broadcast"]["n_video_frames"]   # 164,488
 
-    print(f"[1/3] Wczytywanie homografii i ATD Broadcast: {brd_hom_path.name} ({n_brd} wierszy)...")
+    print(f"[1/3] Loading Broadcast homography and ATD: {brd_hom_path.name} ({n_brd} rows)...")
     df_brd = pd.read_csv(brd_hom_path)
     col_f = "frame" if "frame" in df_brd.columns else df_brd.columns[0]
     df_brd = df_brd.sort_values(col_f).reset_index(drop=True)
@@ -145,7 +145,7 @@ def build_stage0_video():
     # Wczytanie pozycji piłki z kamery broadcast
     brd_bx, brd_by = load_atd_ball_coordinates(brd_atd_path, n_brd)
 
-    print("[2/3] Wyliczanie punktu patrzenia kamery (cam_lookat_x, cam_lookat_y)...")
+    print("[2/3] Computing camera look-at point (cam_lookat_x, cam_lookat_y)...")
     brd_lookat_x, brd_lookat_y = compute_broadcast_lookat(df_brd)
 
     # Inicjalizacja docelowych kolumn na osi czasu Tactical (0 .. 199,318)
@@ -158,7 +158,7 @@ def build_stage0_video():
     aligned_ball_x = np.full(n_tac, np.nan, dtype=np.float64)
     aligned_ball_y = np.full(n_tac, np.nan, dtype=np.float64)
 
-    print("[3/3] Przesuwanie osi czasu Broadcast na oś Tactical wg sync_offset.json (z uwzględnieniem dryfu)...")
+    print("[3/3] Aligning Broadcast timeline to Tactical timeline using sync_offset.json (accounting for drift)...")
     for half_key, info in sync_data.items():
         tac_start = int(info["start_frame"])
         tac_end = int(info["end_frame"])
@@ -184,9 +184,9 @@ def build_stage0_video():
 
         valid_in_half = int(np.sum(aligned_valid[t_sub] == 1))
         print(
-            f"   -> {half_key.upper()}: zsynchronizowano z dryfem "
+            f"   -> {half_key.upper()}: synchronized with drift "
             f"(Tactical {tac_start}..{tac_end}) | "
-            f"valid==1: {valid_in_half}/{len(t_sub)} kl."
+            f"valid==1: {valid_in_half}/{len(t_sub)} frames"
         )
 
     # Budowa finalnej tabeli z nowymi kolumnami brd_ball_x i brd_ball_y
@@ -210,10 +210,10 @@ def build_stage0_video():
     total_valid = int(np.sum(aligned_valid == 1))
     total_brd_balls = int(np.sum(~np.isnan(aligned_ball_x)))
     print("\n" + "=" * 72)
-    print(f"[SUKCES] Zapisano plik: {parquet_path}")
-    print(f"         Wiersze ogółem: {len(df_stage0)}")
-    print(f"         Klatki valid == 1 (gra live): {total_valid} ({100*total_valid/n_tac:.1f}%)")
-    print(f"         Zsynchronizowane pozycje piłki Broadcast: {total_brd_balls}")
+    print(f"[SUCCESS] Saved file: {parquet_path}")
+    print(f"          Total rows: {len(df_stage0)}")
+    print(f"          Valid == 1 frames (live play): {total_valid} ({100*total_valid/n_tac:.1f}%)")
+    print(f"          Synchronized Broadcast ball positions: {total_brd_balls}")
     print("=" * 72)
 
     return df_stage0
